@@ -230,6 +230,7 @@ function applyTableDeleteRowColumn(
 
 export const tableCommands: CommandDef[] = [
   { id: 'table:create', label: '표 만들기', icon: 'icon-table',
+    opensDialog: true,
     canExecute: (ctx) => ctx.hasDocument && !ctx.inTable,
     execute(services, params) {
       const ih = services.getInputHandler();
@@ -277,6 +278,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:cell-props',
+    opensDialog: true,
     label: '표/셀 속성',
     canExecute: (ctx) => ctx.inTable || ctx.inCellSelectionMode || ctx.inTableObjectSelection,
     execute(services) {
@@ -300,6 +302,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:border-each',
+    opensDialog: true,
     label: '각 셀마다 적용(E)...',
     canExecute: inTable,
     execute(services) {
@@ -323,6 +326,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:border-one',
+    opensDialog: true,
     label: '하나의 셀처럼 적용(Z)...',
     canExecute: hasMultiCellSelection,
     execute(services) {
@@ -346,6 +350,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:insert-row-col',
+    opensDialog: true,
     label: '줄/칸 추가하기(I)...',
     shortcutLabel: 'Alt+Enter',
     canExecute: inTable,
@@ -360,6 +365,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:delete-row-col',
+    opensDialog: true,
     label: '줄/칸 지우기(E)...',
     shortcutLabel: 'Alt+Delete',
     canExecute: inTable,
@@ -494,6 +500,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:cell-split',
+    opensDialog: true,
     label: '셀 나누기',
     shortcutLabel: 'S',
     canExecute: inTable,
@@ -708,6 +715,87 @@ export const tableCommands: CommandDef[] = [
         },
       }), '행/열 바꿈 붙여넣기');
       restoreEditorFocus(ih);
+    },
+  },
+  {
+    id: 'table:split',
+    label: '표 나누기',
+    shortcutLabel: 'Ctrl+M,A',
+    canExecute: (ctx) => ctx.inTable,
+    execute(services) {
+      const ih = services.getInputHandler();
+      if (!ih) return;
+      const pos = ih.getCursorPosition();
+      if (pos?.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
+      // 중첩 표(cellPath 깊이 2+)는 flat 인덱스가 바깥 표를 가리켜 오동작한다 —
+      // path 기반 API 가 생기기 전까지는 최상위 표에서만 허용.
+      if ((pos.cellPath?.length ?? 0) > 1) return;
+      const { sectionIndex: sec, parentParaIndex: ppi, controlIndex: ci, cellIndex } = pos;
+      safeTableOp(() => {
+        // Rust 쪽에서도 첫 행을 거부하지만, snapshot 을 뜬 뒤 실패하면 빈 undo
+        // 항목이 남으므로 확정 실패는 executeOperation 전에 걸러낸다.
+        const info = services.wasm.getCellInfo(sec, ppi, ci, cellIndex);
+        if (info.row === 0) {
+          console.warn('[table:split] 첫 번째 줄에서는 표 나누기를 할 수 없습니다.');
+          return;
+        }
+        ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'splitTable',
+          operation: (wasm) => {
+            // 커서 셀(row >= 분할행)은 예외 없이 뒤 표로 옮겨지므로, 작업 전
+            // 위치를 그대로 반환하면 앞 표의 범위 밖 cellIndex 가 된다
+            // (redo 시에도 같은 무효 위치로 복원). 뒤 표 기준으로 재계산한다.
+            const res = wasm.splitTable(sec, ppi, ci, info.row);
+            const frontCells = wasm.getTableDimensions(sec, ppi, ci).cellCount;
+            return {
+              sectionIndex: sec,
+              paragraphIndex: 0,
+              charOffset: 0,
+              parentParaIndex: res.backParaIdx,
+              controlIndex: 0,
+              cellIndex: Math.max(0, cellIndex - frontCells),
+              cellParaIndex: 0,
+            };
+          },
+        });
+      }, '표 나누기');
+    },
+  },
+  {
+    // 한컴 용어는 '붙이기'(attach)지만 의미는 다음 표와의 행 병합이라
+    // WASM API 는 mergeTableWithNext, 이벤트는 TablesMerged 를 쓴다.
+    id: 'table:attach',
+    label: '표 붙이기',
+    shortcutLabel: 'Ctrl+M,Z',
+    canExecute: (ctx) => ctx.inTable || ctx.inTableObjectSelection,
+    execute(services) {
+      const ih = services.getInputHandler();
+      if (!ih) return;
+      // 셀 컨텍스트가 필요 없는 명령이라 표 객체 선택 상태도 지원한다
+      // (table:delete 와 같은 패턴 — 테두리 클릭 진입 시 커서는 셀 밖이다).
+      let sec: number, ppi: number, ci: number;
+      const ref = ih.getSelectedTableRef();
+      if (ref) {
+        sec = ref.sec; ppi = ref.ppi; ci = ref.ci;
+      } else {
+        const pos = ih.getCursorPosition();
+        if (pos?.parentParaIndex === undefined || pos.controlIndex === undefined) return;
+        // 중첩 표(cellPath 깊이 2+)는 flat 인덱스가 바깥 표를 가리켜 오동작한다 —
+        // path 기반 API 가 생기기 전까지는 최상위 표에서만 허용.
+        if ((pos.cellPath?.length ?? 0) > 1) return;
+        sec = pos.sectionIndex; ppi = pos.parentParaIndex; ci = pos.controlIndex;
+      }
+      safeTableOp(() => {
+        ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'mergeTableWithNext',
+          operation: (wasm) => {
+            wasm.mergeTableWithNext(sec, ppi, ci);
+            return ih.getCursorPosition()!;
+          },
+        });
+      }, '표 붙이기');
     },
   },
   {

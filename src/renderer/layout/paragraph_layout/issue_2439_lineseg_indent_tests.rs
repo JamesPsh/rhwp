@@ -1,6 +1,7 @@
-use super::authoritative_stored_line_start_px;
+use super::{authoritative_stored_line_start_px, uses_hwp5_stored_line_start_profile};
 use crate::model::page::{ColumnDef, PageDef};
 use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
+use crate::model::provenance::LayoutCompatibilityProfile;
 use crate::renderer::composer::compose_paragraph;
 use crate::renderer::layout::LayoutEngine;
 use crate::renderer::page_layout::PageLayoutInfo;
@@ -117,6 +118,8 @@ fn synthetic_lineseg_indent_tree() -> crate::renderer::render_tree::PageRenderTr
             wrap_around_paras: Vec::new(),
             used_height: 0.0,
             wrap_anchors: std::collections::HashMap::new(),
+            overlay_continuations: Vec::new(),
+            overlay_cuts: Vec::new(),
         }],
         active_header: None,
         active_footer: None,
@@ -125,6 +128,7 @@ fn synthetic_lineseg_indent_tree() -> crate::renderer::render_tree::PageRenderTr
         footnotes: Vec::new(),
         active_master_page: None,
         extra_master_pages: Vec::new(),
+        ladder_band_tables: Vec::new(),
     };
 
     engine.build_render_tree(
@@ -200,6 +204,20 @@ fn synthetic_or_non_body_geometry_does_not_override_para_margin() {
             false,
         ),
         styled_margin_px,
+    );
+}
+
+#[test]
+fn hwp5_origin_hwpx_keeps_the_hwp5_stored_line_start_contract() {
+    let native_hwp5 = LayoutCompatibilityProfile::new(false, false, false, false, false, true);
+    let hwp5_origin_hwpx = LayoutCompatibilityProfile::new(false, false, false, true, true, false);
+    let original_hwpx = LayoutCompatibilityProfile::new(false, false, true, true, false, false);
+
+    assert!(uses_hwp5_stored_line_start_profile(native_hwp5));
+    assert!(uses_hwp5_stored_line_start_profile(hwp5_origin_hwpx));
+    assert!(
+        !uses_hwp5_stored_line_start_profile(original_hwpx),
+        "원본 HWPX의 별도 저장 LineSeg 계약까지 HWP5로 넓히면 안 된다"
     );
 }
 

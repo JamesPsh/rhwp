@@ -1,5 +1,7 @@
 import type { CommandDef } from '../types';
 import { PicturePropsDialog } from '@/ui/picture-props-dialog';
+import { ChartDataDialog } from '@/ui/chart-data-dialog';
+import { chartTargetFromSelection, matchChartRef } from '@/core/chart-data-target';
 import { EquationEditorDialog } from '@/ui/equation-editor-dialog';
 import { EquationPropertiesDialog } from '@/ui/equation-props-dialog';
 import { SymbolsDialog } from '@/ui/symbols-dialog';
@@ -12,7 +14,8 @@ import type { ShapeType } from '@/ui/shape-picker';
 import type { CellPathLike } from '@/core/types';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { InputHandler } from '@/engine/input-handler';
-import type { RefreshPolicy } from '@/engine/command';
+import { SetObjectPropsCommand, type RefreshPolicy } from '@/engine/command';
+import { getObjectProps, setObjectProps, type ObjectPropsRef } from '@/engine/object-props';
 
 /** 스텁 커맨드 생성 헬퍼 */
 function stub(id: string, label: string, icon?: string, shortcut?: string): CommandDef {
@@ -27,6 +30,7 @@ function stub(id: string, label: string, icon?: string, shortcut?: string): Comm
 }
 
 let picturePropsDialog: PicturePropsDialog | null = null;
+let chartDataDialog: ChartDataDialog | null = null;
 let equationEditorDialog: EquationEditorDialog | null = null;
 let equationPropsDialog: EquationPropertiesDialog | null = null;
 let symbolsDialog: SymbolsDialog | null = null;
@@ -170,6 +174,7 @@ export const insertCommands: CommandDef[] = [
   },
   {
     id: 'insert:equation',
+    opensDialog: true,
     label: '수식',
     shortcutLabel: 'Ctrl+M,M',
     canExecute: (ctx) => ctx.hasDocument && !ctx.inTable,
@@ -202,6 +207,7 @@ export const insertCommands: CommandDef[] = [
   },
   {
     id: 'insert:field',
+    opensDialog: true,
     label: '필드 입력',
     shortcutLabel: 'Ctrl+K+E',
     canExecute: (ctx) => ctx.hasDocument && !ctx.isFormMode,
@@ -287,6 +293,7 @@ export const insertCommands: CommandDef[] = [
   },
   {
     id: 'insert:endnote-shape',
+    opensDialog: true,
     label: '미주 모양',
     icon: 'icon-endnote',
     canExecute: (ctx) => ctx.hasDocument,
@@ -299,6 +306,7 @@ export const insertCommands: CommandDef[] = [
   },
   {
     id: 'insert:symbols',
+    opensDialog: true,
     label: '문자표',
     icon: 'icon-symbols',
     shortcutLabel: 'Alt+F10',
@@ -313,6 +321,7 @@ export const insertCommands: CommandDef[] = [
   stub('insert:hyperlink', '하이퍼링크', 'icon-hyperlink', 'Ctrl+K+H'),
   {
     id: 'insert:bookmark',
+    opensDialog: true,
     label: '책갈피',
     shortcutLabel: 'Ctrl+K,B',
     canExecute: (ctx) => ctx.hasDocument,
@@ -325,6 +334,7 @@ export const insertCommands: CommandDef[] = [
   },
   {
     id: 'insert:picture-props',
+    opensDialog: true,
     label: '개체 속성',
     canExecute: (ctx) => ctx.inPictureObjectSelection,
     execute(services) {
@@ -370,7 +380,40 @@ export const insertCommands: CommandDef[] = [
     },
   },
   {
+    id: 'insert:chart-data-edit',
+    opensDialog: true,
+    label: '차트 데이터 편집',
+    canExecute: (ctx) => ctx.inPictureObjectSelection,
+    execute(services) {
+      const ih = services.getInputHandler();
+      if (!ih) return;
+      const ref = ih.getSelectedPictureRef();
+      if (!ref) return;
+      // [#4694] 선택 → 열거 대조 → 정본 주소(문서 순번). 대조 실패는 조용히 무시 —
+      // 메뉴 노출 판정(input-handler)과 같은 경로라 여기 도달하면 보통 성공한다.
+      const target = chartTargetFromSelection(ref);
+      if (!target) return;
+      let matched = null;
+      try {
+        matched = matchChartRef(services.wasm.listCharts(), target);
+      } catch {
+        return;
+      }
+      if (!matched) return;
+      if (!chartDataDialog) {
+        chartDataDialog = new ChartDataDialog(services.wasm, services.eventBus, services);
+      }
+      // 닫힘 후 편집기 포커스 복구 — 없으면 이어지는 Ctrl+Z 가 문서에 닿지 않는다
+      // (field:edit 의 onClose 복원과 동형).
+      chartDataDialog.afterClose = () => {
+        requestAnimationFrame(() => ih.focus());
+      };
+      chartDataDialog.open(matched);
+    },
+  },
+  {
     id: 'insert:equation-edit',
+    opensDialog: true,
     label: '수식 편집',
     canExecute: (ctx) => ctx.inPictureObjectSelection,
     execute(services) {
@@ -411,7 +454,10 @@ export const insertCommands: CommandDef[] = [
           captionIncludeMargin: false,
         };
         let result: any;
-        result = setProps(services, ref, captionProps);
+        // [Task #3230] `setProps` 래퍼가 사라져 공유 라우팅을 직접 부른다. 이 경로는 종전부터
+        // 라우터를 거치지 않고 직접 적용하고 `document-changed` 를 스스로 emit 한다 —
+        // 회전/대칭과 달리 이번 변경 대상이 아니라 종전 동작 그대로 둔다.
+        result = setObjectProps(services.wasm, ref, captionProps);
         // "그림 N " 끝 위치를 Rust가 반환
         charOffset = result?.captionCharOffset ?? 4;
         services.eventBus.emit('document-changed');
@@ -573,39 +619,17 @@ export const insertCommands: CommandDef[] = [
   },
 ];
 
-/** 선택 개체 ref 타입 — cursor.selectedPictureRef 와 정합 (headerFooter optional, [Task #831]) */
-type PictureRef = {
-  sec: number;
-  ppi: number;
-  ci: number;
-  type: string;
-  cellPath?: CellPathLike;
-  headerFooter?: { kind: 'header' | 'footer'; outerParaIdx: number; outerControlIdx: number };
-};
+/**
+ * 선택 개체 ref 타입 — cursor.selectedPictureRef 와 정합 (headerFooter optional, [Task #831]).
+ *
+ * [Task #3230] 분기 본체는 `engine/object-props.ts` 로 옮겼다 — 역연산 커맨드가 undo 시점에
+ * 같은 분기를 써야 하는데, 커맨드는 `services` 가 아니라 `WasmBridge` 만 받기 때문이다.
+ */
+type PictureRef = ObjectPropsRef;
 
-/** 선택 개체의 속성을 조회/변경 헬퍼 (shape/picture 분기) */
+/** 선택 개체의 속성 조회 (shape/picture·셀·머리말꼬리말 분기). */
 function getProps(services: import('../types').CommandServices, ref: PictureRef): Record<string, unknown> {
-  if (ref.type === 'shape') {
-    if (ref.cellPath && ref.cellPath.length > 0) {
-      return services.wasm.getCellShapePropertiesByPath(ref.sec, ref.ppi, ref.cellPath, ref.ci) as unknown as Record<string, unknown>;
-    }
-    return services.wasm.getShapeProperties(ref.sec, ref.ppi, ref.ci) as unknown as Record<string, unknown>;
-  }
-  // [Task #831] 머리말/꼬리말 picture 의 경우 별도 API 호출 (PR #832 의 wasm-bridge).
-  // 미적용 시 본문 lookup 실패 → props 빈/stale → 회전/대칭 무동작.
-  if (ref.headerFooter) {
-    return services.wasm.getHeaderFooterPictureProperties(
-      ref.sec,
-      ref.headerFooter.outerParaIdx,
-      ref.headerFooter.outerControlIdx,
-      ref.ppi,
-      ref.ci,
-    ) as unknown as Record<string, unknown>;
-  }
-  if (ref.cellPath && ref.cellPath.length > 0) {
-    return services.wasm.getCellPicturePropertiesByPath(ref.sec, ref.ppi, ref.cellPath, ref.ci) as unknown as Record<string, unknown>;
-  }
-  return services.wasm.getPictureProperties(ref.sec, ref.ppi, ref.ci) as unknown as Record<string, unknown>;
+  return getObjectProps(services.wasm, ref);
 }
 
 /**
@@ -621,7 +645,15 @@ function recordObjectMutation(
   mutate: (wasm: WasmBridge) => boolean | void,
   opts?: { refresh?: RefreshPolicy },
 ): void {
-  const pos = ih.getCursorPosition();
+  // [Task #3351] 개체 선택은 `cursor.position` 을 옮기지 않는다. 그래서 여기서 그냥
+  // `getCursorPosition()` 을 잡으면 **개체를 선택하기 직전 캐럿**이 기록되고, undo/redo 가
+  // 조작과 무관한 자리(문서 상단일 수도 있다)로 착지한다.
+  //
+  // 한컴 2024 실측: 개체 선택은 캐럿을 앵커로 끌고 가고, 캐럿을 다른 문단으로 옮기면 선택이
+  // 풀린다 — "캐럿은 딴 곳, 개체는 선택" 이라는 상태 자체가 없다. 삭제·undo·redo 내내 캐럿은
+  // 개체 인접 문단에 머문다. Delete 키 경로(`performDelete`)가 이미 그렇게 하고 있으므로
+  // 메뉴 경로도 같은 자리를 기록한다.
+  const pos = ih.getPositionOutsideSelectedPicture() ?? ih.getCursorPosition();
   ih.executeOperation({
     kind: 'snapshot',
     operationType,
@@ -664,28 +696,68 @@ function changeZOrder(
   ih.exitPictureObjectSelectionAndAfterEdit();
 }
 
-function setProps(services: import('../types').CommandServices, ref: PictureRef, props: Record<string, unknown>): any {
-  if (ref.type === 'shape') {
-    if (ref.cellPath && ref.cellPath.length > 0) {
-      return services.wasm.setCellShapePropertiesByPath(ref.sec, ref.ppi, ref.cellPath, ref.ci, props);
-    }
-    return services.wasm.setShapeProperties(ref.sec, ref.ppi, ref.ci, props);
-  } else if (ref.headerFooter) {
-    // [Task #831] 머리말/꼬리말 picture setter — 5-tuple lookup 으로 IR 갱신.
-    return services.wasm.setHeaderFooterPictureProperties(
-      ref.sec,
-      ref.headerFooter.outerParaIdx,
-      ref.headerFooter.outerControlIdx,
-      ref.ppi,
-      ref.ci,
-      props,
-    );
-  } else {
-    if (ref.cellPath && ref.cellPath.length > 0) {
-      return services.wasm.setCellPicturePropertiesByPath(ref.sec, ref.ppi, ref.cellPath, ref.ci, props);
-    }
-    return services.wasm.setPictureProperties(ref.sec, ref.ppi, ref.ci, props);
+/**
+ * [Task #3230] 절대 속성 하나를 **역연산 커맨드로** 적용하고 기록한다.
+ *
+ * 스냅샷(`recordObjectMutation`) 대신 `kind:'command'`를 쓴다 — 되돌릴 것이 스칼라 하나인데
+ * `Document` 통째 클론 2개(문서에 따라 최대 21 MB)를 스택에 얹을 이유가 없다. 호출부가 이미
+ * 적용 전 값을 읽어 두었으므로 before 가 정확하다. setter를 라우터 전에 직접 호출하지 않아야
+ * 양식 모드의 편집 허용 검사가 실제 변경보다 먼저 실행된다.
+ *
+ * refresh 를 'full' 로 명시한다 — command 라우팅의 자동 판정에 맡기면 개체 회전/대칭의 화면 반영이
+ * 보장되지 않는다. 종전 스냅샷 라우팅의 'full' 이 `afterEdit()` → `document-changed` 를 대신
+ * emit 해 주고 있었다(그래서 호출부의 수동 emit 이 [undo P3 정리] 에서 제거됐다).
+ */
+function executeAbsolutePropChange(
+  ih: InputHandler,
+  ref: PictureRef,
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+): void {
+  ih.executeOperation({
+    kind: 'command',
+    command: new SetObjectPropsCommand(ref, before, after),
+    meta: { refresh: 'full' },
+  });
+}
+
+/**
+ * [Task #3230] 속성 왕복이 **참인 역연산인 대상**인지.
+ *
+ * 도형은 참이다 — `rotationAngle` 은 평범한 필드 대입이고 flip 은 비트를 대칭으로 set/clear
+ * 한다(`document_core/commands/object_ops/shape.rs`). 같은 값을 다시 넣으면 원래 상태다.
+ *
+ * **그림·OLE 는 아니다.** `rotationAngle` 이 섞이면 `refresh_picture_rotation_layout_for_save`
+ * 가 각도와 무관하게 — 0 으로 되돌리는 경우까지 — `rotate_image = true` 와
+ * `flip |= 0x0008_0000` 을 세운다(`object_ops/picture.rs:242-243`). 이 둘을 다시 내리는 경로는
+ * 저장소에 없어서, 90° 돌렸다 되돌린 그림은 화면은 같아도 저장 바이트가 원본과 달라진다
+ * (HWPX `hp:rotationInfo rotateimage`·HWP5 `HWPTAG_SHAPE_COMPONENT` 의 flip 비트).
+ * 대칭도 `TRANSFORM_KEYS`(picture.rs:176-184)에 걸려 `raw_rendering`·`render_*` 캐시를
+ * 기본값으로 리셋한다.
+ *
+ * 속성 bag 만으로는 이것들을 복원할 수 없다. 문서를 통째로 되돌리는 스냅샷이라야 정확하므로
+ * 그림·OLE 는 종전 경로를 유지한다 — 되돌리기의 정확성이 스냅샷 비용보다 앞선다.
+ */
+function absolutePropChangeIsInvertible(ref: PictureRef): boolean {
+  return ref.type === 'shape';
+}
+
+/** 역연산이 참이면 커맨드로, 아니면 종전 스냅샷으로 기록한다. */
+function applyAbsolutePropChange(
+  services: import('../types').CommandServices,
+  ih: InputHandler,
+  ref: PictureRef,
+  operationType: string,
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+): void {
+  if (absolutePropChangeIsInvertible(ref)) {
+    executeAbsolutePropChange(ih, ref, before, after);
+    return;
   }
+  recordObjectMutation(ih, operationType, (wasm) => {
+    setObjectProps(wasm, ref, after);
+  });
 }
 
 /** 현재 회전각에 delta(도)를 더한다 (shape + image 지원). */
@@ -701,9 +773,11 @@ function applyRotationDelta(services: import('../types').CommandServices, delta:
   // -180 ~ 180 범위로 정규화
   next = ((next % 360) + 360) % 360;
   if (next > 180) next -= 360;
-  // recordObjectMutation → executeOperation snapshot 의 'full' refresh 가 afterEdit()→
-  // 'document-changed' 를 이미 emit 한다. 수동 emit 은 중복(이중 렌더)이라 제거. [undo P3 정리]
-  recordObjectMutation(ih, 'rotateObject', () => setProps(services, ref, { rotationAngle: next }));
+  // [Task #3230] 도형은 역연산, 그림·OLE 는 스냅샷 유지(`absolutePropChangeIsInvertible`).
+  // `cur` 는 이미 위에서 읽은 적용 전 각도이고 setter 가 절대값이라 되돌리기가 자명하다.
+  applyAbsolutePropChange(
+    services, ih, ref, 'rotateObject', { rotationAngle: cur }, { rotationAngle: next },
+  );
 }
 
 /** horzFlip/vertFlip을 토글한다 (shape + image 지원). */
@@ -715,6 +789,6 @@ function toggleFlip(services: import('../types').CommandServices, key: 'horzFlip
   const props = getProps(services, ref);
   if (props.sizeProtect) return;
   const cur = !!props[key];
-  // 위 rotate 와 동일 — snapshot 라우팅이 이미 refresh 하므로 수동 emit 제거. [undo P3 정리]
-  recordObjectMutation(ih, 'flipObject', () => setProps(services, ref, { [key]: !cur }));
+  // 위 rotate 와 동일 — 토글이지만 setter 에 넘기는 값은 절대값(`!cur`)이라 역연산이 자명하다.
+  applyAbsolutePropChange(services, ih, ref, 'flipObject', { [key]: cur }, { [key]: !cur });
 }

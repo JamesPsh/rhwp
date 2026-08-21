@@ -7,12 +7,17 @@ export interface DocumentInfo {
   hwp3Variant?: boolean;
   fallbackFont: string;
   fontsUsed: string[];  // 문서에서 사용하는 폰트 이름 목록
+  /** HWPX non-embedded substFont: [원본 face, 문서 선언 대체 face]. */
+  fontSubstitutions?: Array<[string, string]>;
 }
 
 /** WASM getPageInfo() 반환 타입 */
 export interface PageInfo {
   pageIndex: number;
-  /** 조판 기준으로 계산된 표시용 쪽 번호(구역 설정 반영) */
+  /** 문서가 매기는 쪽번호 (1-based, `쪽 > 새 번호로 시작` 반영).
+   *
+   * 물리 순번(pageIndex + 1)과 다를 수 있다 — 상태 표시줄이 보여야 할 숫자는 이쪽이다.
+   * 구 WASM 은 이 필드를 내보내지 않으므로 optional 이다 (#5749). */
   pageNumber?: number;
   width: number;
   height: number;
@@ -29,6 +34,17 @@ export interface PageInfo {
   marginHeader: number;
   /** 꼬리말 여백 (px) */
   marginFooter: number;
+  /** 본문 상자의 왼쪽/오른쪽 (px, 페이지 좌표).
+   *
+   * marginLeft/marginRight 는 PageDef 원본이라 제본 여백이 빠져 있고 맞쪽 제본 짝수 쪽의
+   * 좌우 뒤바꿈도 반영되지 않는다. 그리기·히트테스트처럼 "본문이 실제로 어디부터인가"가
+   * 필요한 곳은 이 둘을 쓴다 (#4971). */
+  bodyLeft: number;
+  bodyRight: number;
+  /** 제본 여백 (px) — 본문 왼쪽 경계에 더해져 있다 */
+  marginGutter?: number;
+  /** 맞쪽 제본의 짝수 쪽인가 — 그 쪽은 좌우 여백이 뒤바뀌어 적용된다 */
+  bindingMirrored?: boolean;
   /** 쪽 테두리/쪽 영역 왼쪽 위치 (px) */
   pageBorderLeft?: number;
   /** 쪽 테두리/쪽 영역 오른쪽 여백 (px) */
@@ -567,8 +583,15 @@ export interface ControlLayoutItem {
   plane?: number;
   /** [Task #1280 v2] 개체 z-order (작을수록 먼저 그림 = 아래). */
   zOrder?: number;
-  /** [Task #1280 v2] 같은 plane/zOrder 내 안정 정렬 tie-breaker. */
-  stableIndex?: number;
+  /**
+   * [Task #1280 v2] 같은 plane/zOrder 내 안정 정렬 tie-breaker.
+   * [#4334] 더 이상 스칼라가 아니다 — 문서 경로 배열
+   * `[secIdx, paraIdx, ...셀 경로(controlIdx,cellIdx,cellParaIdx)*, controlIdx]`
+   * (`doc_path_for_node`, render_tree.rs). `next_id()` 카운터에도, layer 유무에 따라
+   * 서로 다른 자릿수 공간을 쓰던 예전 패킹된 u32 에도 의존하지 않는다. 사전식 비교
+   * (`compareLexArrays`, input-handler-picture.ts) 로 정렬한다.
+   */
+  stableIndex?: number[];
   /** [Task #1280 v2] 텍스트 어울림 모드(이미지뿐 아니라 shape/line/group에도 노출). */
   wrap?: string;
   /**
@@ -954,6 +977,7 @@ export interface PageLayerTree {
     /** Compatibility mirror; prefer debugOptions.debugOverlay. */
     debugOverlay?: boolean;
   };
+  fontResources?: LayerFontResources;
   resources?: LayerResources;
   root: LayerNode;
 }
@@ -966,6 +990,43 @@ export interface LayerResources {
   svgFragments?: Array<string | undefined>;
   svgHashes?: string[];
   svgKeys?: string[];
+  fontBlobs?: Array<Uint8Array | number[] | string | undefined>;
+  fontBlobKeys?: string[];
+}
+
+export interface LayerFontResources {
+  blobs: LayerFontBlobResource[];
+  faces: LayerFontFaceResource[];
+}
+
+export interface LayerFontDigest {
+  algorithm: string;
+  value: string;
+}
+
+export interface LayerFontBlobResource {
+  id: string;
+  source: 'embedded' | 'bundled' | 'systemResolved' | 'externalUrl' | 'unresolvedFallback';
+  portability:
+    | 'portableBlob'
+    | 'externalVerified'
+    | 'resolvedButNotEmbedded'
+    | 'systemNameOnly'
+    | 'unresolvedFallback';
+  digest?: LayerFontDigest;
+  dataRef?: { kind: 'fontBlob' | 'externalFont'; id: string };
+}
+
+export interface LayerFontFaceResource {
+  id: string;
+  blobKey: string;
+  faceIndex: number;
+  postscriptName?: string;
+  familyNames?: Array<{ value: string; locale?: string }>;
+  styleNames?: Array<{ value: string; locale?: string }>;
+  weightClass?: number;
+  widthClass?: number;
+  italic?: boolean;
 }
 
 export interface LayerInfo {
@@ -1035,6 +1096,7 @@ export interface LayerPageBackgroundOp {
   backgroundColor?: string;
   borderColor?: string;
   borderWidth?: number;
+  gradient?: LayerGradientFill;
 }
 
 export interface LayerTextStyle {
@@ -1102,6 +1164,7 @@ export interface LayerTextRunOp {
   baseline?: number;
   rotation?: number;
   isVertical?: boolean;
+  orientation?: 'horizontal' | 'vertical-upright' | 'vertical-sideways';
   style?: LayerTextStyle;
   placement?: { runToPage?: LayerAffineTransform; baselineY?: number };
   positions?: number[];
@@ -1126,22 +1189,54 @@ export interface LayerFootnoteMarkerOp {
   color?: string;
 }
 
+export type LayerStrokeDash = 'solid' | 'dash' | 'dot' | 'dashDot' | 'dashDotDot';
+
+export interface LayerShadowStyle {
+  shadowType?: number;
+  color?: string;
+  offsetX?: number;
+  offsetY?: number;
+  alpha?: number;
+}
+
+export interface LayerPatternFill {
+  patternType?: number;
+  patternColor?: string;
+  backgroundColor?: string;
+}
+
 export interface LayerLineStyle {
   color?: string;
   width?: number;
-  dash?: string;
+  dash?: LayerStrokeDash;
   lineType?: string;
   startArrow?: string;
   endArrow?: string;
+  startArrowSize?: number;
+  endArrowSize?: number;
+  shadow?: LayerShadowStyle;
 }
 
 export interface LayerShapeStyle {
   fillColor?: string | null;
   strokeColor?: string | null;
   strokeWidth?: number;
-  strokeDash?: string;
+  strokeDash?: LayerStrokeDash;
   opacity?: number;
+  pattern?: LayerPatternFill;
+  shadow?: LayerShadowStyle;
 }
+
+/** HWP 도형/페이지 배경 그라데이션. paint JSON `gradient` 필드와 동일. */
+export interface LayerGradientFill {
+  gradientType?: number;
+  angle?: number;
+  centerX?: number;
+  centerY?: number;
+  colors?: string[];
+  positions?: number[];
+}
+
 
 export interface LayerLineOp {
   type: 'line';
@@ -1158,12 +1253,14 @@ export interface LayerRectangleOp {
   bbox: LayerBounds;
   cornerRadius?: number;
   style?: LayerShapeStyle;
+  gradient?: LayerGradientFill;
 }
 
 export interface LayerEllipseOp {
   type: 'ellipse';
   bbox: LayerBounds;
   style?: LayerShapeStyle;
+  gradient?: LayerGradientFill;
 }
 
 export type LayerPathCommand =
@@ -1195,6 +1292,7 @@ export interface LayerPathOp {
   style?: LayerShapeStyle;
   lineStyle?: LayerLineStyle;
   transform?: LayerPathTransform;
+  gradient?: LayerGradientFill;
 }
 
 export interface LayerImageOp {
@@ -1377,7 +1475,21 @@ export interface LayerCharOverlapOp {
 export interface LayerGlyphRunOp {
   type: 'glyphRun';
   bbox: LayerBounds;
-  variant?: LayerTextVariantMeta;
+  source: LayerTextSourceSpan;
+  variant: LayerTextVariantMeta;
+  paintStyle: LayerTextStyle;
+  shapeKey: LayerShapeKey;
+  placement: LayerTextRunPlacement;
+  glyphIds: number[];
+  positions: LayerPoint[];
+  advances?: LayerVector[];
+  clusters: LayerGlyphCluster[];
+  direction: LayerTextDirection;
+  bidiLevel?: number;
+  writingMode: LayerWritingMode;
+  orientation: LayerGlyphRunOrientation;
+  glyphTransforms?: LayerGlyphTransform[];
+  diagnostics: LayerGlyphRunDiagnostics;
 }
 
 export interface LayerGlyphOutlineOp {
@@ -1407,6 +1519,88 @@ export interface LayerTextVariantMeta {
   quality?: string;
   anchorOpId?: string;
   localPaintOrder?: number;
+}
+
+export interface LayerTextSourceRange {
+  start: number;
+  end: number;
+}
+
+export interface LayerTextSourceSpan {
+  id: number;
+  utf8Range: LayerTextSourceRange;
+  utf16Range: LayerTextSourceRange;
+  stableSourceKey?: string;
+}
+
+export interface LayerTextRunPlacement {
+  runToPage: LayerAffineTransform;
+  baselineY?: number;
+}
+
+export interface LayerPoint {
+  x: number;
+  y: number;
+}
+
+export interface LayerVector {
+  dx: number;
+  dy: number;
+}
+
+export interface LayerShapeKey {
+  fontInstance: {
+    faceKey: string;
+    sizePx: number;
+    variations?: Array<{ tag: string; value: number }>;
+    syntheticBold?: boolean;
+    syntheticItalic?: boolean;
+  };
+  direction: LayerTextDirection;
+  writingMode: LayerWritingMode;
+  script?: string;
+  language?: string;
+  features?: Array<{ tag: string; enabled: boolean; value?: number }>;
+  shapingEngine: string;
+  fallbackPolicy: string;
+}
+
+export type LayerTextDirection = 'ltr' | 'rtl' | 'auto';
+export type LayerWritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr';
+export type LayerGlyphRunOrientation =
+  | 'horizontal'
+  | 'vertical-upright'
+  | 'vertical-sideways'
+  | 'mixedPerGlyph';
+
+export interface LayerGlyphCluster {
+  sourceRangeUtf8: LayerTextSourceRange;
+  sourceRangeUtf16?: LayerTextSourceRange;
+  textRangeUtf8?: LayerTextSourceRange;
+  glyphRange: LayerTextSourceRange;
+  flags?: Array<'ligature' | 'fallbackBoundary'>;
+}
+
+export interface LayerGlyphTransform {
+  xx: number;
+  xy: number;
+  yx: number;
+  yy: number;
+  tx: number;
+  ty: number;
+}
+
+export interface LayerGlyphRunDiagnostics {
+  quality: 'exact' | 'positionAdjusted' | 'approximate' | 'diagnosticOnly' | 'omitted';
+  replayEligibility: 'portable' | 'conditionalExternalFont' | 'localDiagnosticOnly' | 'notReplayable';
+  strictVisualEligible: boolean;
+  maxOriginDeltaPx: number;
+  maxAdvanceDeltaPx: number;
+  maxResidualAfterAdjustmentPx: number;
+  clusterMismatchCount: number;
+  missingGlyphCount: number;
+  usedFallbackFontCount: number;
+  reason?: string;
 }
 
 export type LayerGlyphOutlinePayloadKind =

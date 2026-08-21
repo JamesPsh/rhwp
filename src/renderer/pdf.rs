@@ -586,9 +586,63 @@ fn add_font_fallbacks(svg: &str, options: &PdfExportOptions) -> String {
     )
 }
 
+/// #3772: bold `<text>`/`<tspan>` 에서만 ExtraLight 를 뺀다.
+///
+/// SVG 생성기가 이미 뺀 경우 no-op. 외부 SVG 나 옛 골든을 svg2pdf 에 넣을 때도
+/// ExtraLight(200) 이 bold 로 남지 않게 하는 PDF 직전 안전망이다.
 #[cfg(not(target_arch = "wasm32"))]
-fn apply_pdf_font_options(svg: &str, options: &PdfExportOptions) -> String {
+fn drop_extralight_from_bold_svg_runs(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(rel) = rest.find('<') {
+        out.push_str(&rest[..rel]);
+        rest = &rest[rel..];
+        let end = rest.find('>').map(|i| i + 1).unwrap_or(rest.len());
+        let tag = &rest[..end];
+        rest = &rest[end..];
+        if svg_tag_is_text_run(tag) && svg_tag_is_bold_weight(tag) {
+            out.push_str(&crate::renderer::drop_noto_sans_kr_extralight(tag));
+        } else {
+            out.push_str(tag);
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn svg_tag_is_text_run(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('<') else {
+        return false;
+    };
+    let name = rest
+        .split(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+        .next()
+        .unwrap_or("");
+    name.eq_ignore_ascii_case("text") || name.eq_ignore_ascii_case("tspan")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn svg_tag_is_bold_weight(tag: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    if lower.contains("font-weight=\"bold\"") || lower.contains("font-weight='bold'") {
+        return true;
+    }
+    for weight in ["600", "700", "800", "900"] {
+        if lower.contains(&format!("font-weight=\"{weight}\""))
+            || lower.contains(&format!("font-weight='{weight}'"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// SVG→PDF 직전에 generic 폴백·수식 폰트·bold ExtraLight 제거를 적용한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_pdf_font_options(svg: &str, options: &PdfExportOptions) -> String {
     let svg = add_font_fallbacks(svg, options);
+    let svg = drop_extralight_from_bold_svg_runs(&svg);
     if let Some(equation_font) = options.equation_font.as_deref() {
         let attr = format!(
             "font-family=\"{}\"",
@@ -665,6 +719,127 @@ fn escape_xml_attr(value: &str) -> String {
     escaped
 }
 
+/// [#3824] PDF 텍스트 표면(`ToUnicode`)의 한컴 PUA 를 표준 코드포인트로 바꾼다.
+///
+/// #3385 가 `export-text` 표면을 고쳤지만, 사용자가 실제로 검색하는 **PDF 표면**은
+/// 그대로 PUA 를 내보내고 있었다. "①" 을 검색하면 안 걸리고 스크린리더는 사설 영역
+/// 문자를 읽는다.
+///
+/// **렌더 결정은 건드리지 않는다.** 글리프 선택은 PUA 로 두어야 fallback 이 맞는다
+/// (`map_pua_bullet_char` 주석 참조). 바꿀 곳은 글리프 → 유니코드 대응표뿐이다.
+///
+/// 매핑은 새로 짓지 않고 텍스트 표면이 쓰는 표(`pua_to_text_surface`)를 그대로
+/// 재사용한다 — 두 표면이 갈리지 않게 하는 것이 이 수정의 요지다.
+///
+/// ## 왜 바이트 수준인가
+///
+/// `ToUnicode` CMap 은 svg2pdf 가 만든다. 그런데 한컴 PUA 의 뜻은 **rhwp 도메인
+/// 지식**이라 범용 SVG 변환기가 알 이유가 없다. 그래서 rhwp 가 자기 출력에서
+/// 대응표만 고친다.
+///
+/// 안전 근거 — 실측으로 확인한 세 성질에 기댄다.
+///   1. CMap 스트림은 **비압축**이다(`/Type /CMap`, `/Filter` 없음).
+///   2. svg2pdf 는 `beginbfchar` 만 쓴다(`beginbfrange` 0개).
+///   3. 대체 문자열이 원본보다 짧으므로 **공백으로 채워 길이를 보존**한다 →
+///      `/Length` 와 xref 오프셋을 건드리지 않는다. 채움 공백은 꺾쇠 **안**에
+///      들어가는데(`<2460    >`), PDF 명세상 16진 문자열 안의 공백은 무시되므로
+///      `<2460>` 과 같은 값이다.
+///
+/// 길이가 늘어나는 경우(다중 문자 대체)는 **건너뛴다** — 길이 보존이 깨지기 때문이다.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn remap_pua_in_tounicode(pdf: &mut [u8]) {
+    const BEGIN: &[u8] = b"beginbfchar";
+    const END: &[u8] = b"endbfchar";
+    let mut cursor = 0usize;
+    while let Some(rel) = find_bytes(&pdf[cursor..], BEGIN) {
+        let start = cursor + rel + BEGIN.len();
+        let Some(rel_end) = find_bytes(&pdf[start..], END) else {
+            break;
+        };
+        let end = start + rel_end;
+        remap_bfchar_block(&mut pdf[start..end]);
+        cursor = end + END.len();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// `<src> <dst>` 쌍이 늘어선 블록에서 dst 만 고친다.
+#[cfg(not(target_arch = "wasm32"))]
+fn remap_bfchar_block(block: &mut [u8]) {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < block.len() {
+        if block[i] == b'<' {
+            match block[i + 1..].iter().position(|&b| b == b'>') {
+                Some(rel) => {
+                    spans.push((i + 1, i + 1 + rel));
+                    i += rel + 2;
+                }
+                None => break,
+            }
+            continue;
+        }
+        i += 1;
+    }
+    // 짝수 번째가 src, 홀수 번째가 dst 다.
+    for pair in spans.chunks(2) {
+        let dst = match pair {
+            [_src, dst] => *dst,
+            _ => continue,
+        };
+        let (s, e) = dst;
+        let text = match utf16be_hex_to_string(&block[s..e]) {
+            Some(t) => t,
+            None => continue,
+        };
+        let mapped = crate::renderer::composer::pua_to_text_surface(&text);
+        if mapped.as_ref() == text.as_str() {
+            continue;
+        }
+        let hex = string_to_utf16be_hex(mapped.as_ref());
+        if hex.len() > e - s {
+            continue; // 길이 보존이 깨진다 — 손대지 않는다
+        }
+        block[s..s + hex.len()].copy_from_slice(hex.as_bytes());
+        for b in &mut block[s + hex.len()..e] {
+            *b = b' ';
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn utf16be_hex_to_string(hex: &[u8]) -> Option<String> {
+    if hex.is_empty() || !hex.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut units = Vec::with_capacity(hex.len() / 4);
+    for quad in hex.chunks(4) {
+        let mut v: u16 = 0;
+        for &b in quad {
+            let d = (b as char).to_digit(16)? as u16;
+            v = v.checked_mul(16)?.checked_add(d)?;
+        }
+        units.push(v);
+    }
+    String::from_utf16(&units).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn string_to_utf16be_hex(s: &str) -> String {
+    let mut out = String::new();
+    for unit in s.encode_utf16() {
+        out.push_str(&format!("{unit:04X}"));
+    }
+    out
+}
+
 /// 단일 SVG를 PDF로 변환
 #[cfg(not(target_arch = "wasm32"))]
 pub fn svg_to_pdf(svg_content: &str) -> Result<Vec<u8>, String> {
@@ -680,6 +855,108 @@ pub fn svg_to_pdf_with_options(
     svgs_to_pdf_with_options(&[svg_content.to_string()], options)
 }
 
+/// #3773: 한 페이지의 svg2pdf `SubsetError` 를 문서 전체 실패로 올리지 않는다.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Svg2pdfPageIsolation {
+    /// 서브셋과 무관한 변환 오류. 문서 전체를 실패시킨다.
+    Fatal,
+    /// `embed_text=true` 첫 실패. 글리프 path 변환으로 한 번 재시도한다.
+    RetryWithoutEmbedText,
+    /// 재시도 뒤에도 `SubsetError`. 해당 페이지만 건너뛴다.
+    SkipPage,
+}
+
+/// svg2pdf 페이지 변환 오류를 격리 정책으로 분류한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn classify_svg2pdf_page_error(
+    err: &svg2pdf::ConversionError,
+    embed_text: bool,
+    already_retried: bool,
+) -> Svg2pdfPageIsolation {
+    if !matches!(err, svg2pdf::ConversionError::SubsetError(_)) {
+        return Svg2pdfPageIsolation::Fatal;
+    }
+    if embed_text && !already_retried {
+        Svg2pdfPageIsolation::RetryWithoutEmbedText
+    } else {
+        Svg2pdfPageIsolation::SkipPage
+    }
+}
+
+/// 시험용 dummy `SubsetError`. 실제 폰트 ID 가 없어도 격리 분기를 탈 수 있다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg2pdf_subset_error_stub() -> svg2pdf::ConversionError {
+    svg2pdf::ConversionError::SubsetError(usvg::fontdb::ID::dummy())
+}
+
+/// 시험용 비-Subset 변환 오류. 문서 전체 실패 분기를 고정한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg2pdf_invalid_image_error() -> svg2pdf::ConversionError {
+    svg2pdf::ConversionError::InvalidImage
+}
+
+/// svg2pdf `to_chunk` 래퍼. 시험이 성공 경로를 재사용할 때 쓴다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svg2pdf_to_chunk(
+    tree: &usvg::Tree,
+    embed_text: bool,
+) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError> {
+    let mut conversion = svg2pdf::ConversionOptions::default();
+    conversion.embed_text = embed_text;
+    svg2pdf::to_chunk(tree, conversion)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn convert_page_chunk<F>(
+    tree: &usvg::Tree,
+    embed_text: bool,
+    page_index: usize,
+    to_chunk: &mut F,
+) -> Result<Option<(pdf_writer::Chunk, pdf_writer::Ref)>, String>
+where
+    F: FnMut(
+        &usvg::Tree,
+        bool,
+    ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
+{
+    match to_chunk(tree, embed_text) {
+        Ok(ok) => Ok(Some(ok)),
+        Err(err) => match classify_svg2pdf_page_error(&err, embed_text, false) {
+            Svg2pdfPageIsolation::Fatal => Err(format!("SVG→chunk 변환 실패: {:?}", err)),
+            Svg2pdfPageIsolation::RetryWithoutEmbedText => {
+                eprintln!(
+                    "WARN: 페이지 {} svg2pdf SubsetError({err:?}) — embed_text=false 로 재시도합니다.",
+                    page_index + 1
+                );
+                match to_chunk(tree, false) {
+                    Ok(ok) => Ok(Some(ok)),
+                    Err(err2) => match classify_svg2pdf_page_error(&err2, false, true) {
+                        Svg2pdfPageIsolation::SkipPage => {
+                            eprintln!(
+                                "WARN: 페이지 {} svg2pdf SubsetError({err2:?}) — 이 페이지만 건너뛰고 PDF 를 계속합니다.",
+                                page_index + 1
+                            );
+                            Ok(None)
+                        }
+                        Svg2pdfPageIsolation::Fatal
+                        | Svg2pdfPageIsolation::RetryWithoutEmbedText => {
+                            Err(format!("SVG→chunk 변환 실패: {:?}", err2))
+                        }
+                    },
+                }
+            }
+            Svg2pdfPageIsolation::SkipPage => {
+                eprintln!(
+                    "WARN: 페이지 {} svg2pdf SubsetError({err:?}) — 이 페이지만 건너뛰고 PDF 를 계속합니다.",
+                    page_index + 1
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
 /// 여러 SVG 페이지를 단일 다중 페이지 PDF로 생성
 #[cfg(not(target_arch = "wasm32"))]
 pub fn svgs_to_pdf(svg_pages: &[String]) -> Result<Vec<u8>, String> {
@@ -692,6 +969,24 @@ pub fn svgs_to_pdf_with_options(
     svg_pages: &[String],
     export_options: &PdfExportOptions,
 ) -> Result<Vec<u8>, String> {
+    svgs_to_pdf_with_to_chunk(svg_pages, export_options, svg2pdf_to_chunk)
+}
+
+/// 페이지별 `to_chunk` 를 주입할 수 있는 PDF 변환.
+///
+/// #3773: `SubsetError` 는 경고로 강등하고 나머지 페이지를 계속한다.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn svgs_to_pdf_with_to_chunk<F>(
+    svg_pages: &[String],
+    export_options: &PdfExportOptions,
+    mut to_chunk: F,
+) -> Result<Vec<u8>, String>
+where
+    F: FnMut(
+        &usvg::Tree,
+        bool,
+    ) -> Result<(pdf_writer::Chunk, pdf_writer::Ref), svg2pdf::ConversionError>,
+{
     if svg_pages.is_empty() {
         return Err("페이지가 없습니다".to_string());
     }
@@ -716,18 +1011,19 @@ pub fn svgs_to_pdf_with_options(
 
     let mut page_datas: Vec<PageData> = Vec::new();
 
-    for svg in svg_pages {
+    for (page_index, svg) in svg_pages.iter().enumerate() {
         let svg_with_fallback = apply_pdf_font_options(svg, export_options);
         let tree = usvg::Tree::from_str(&svg_with_fallback, &options)
             .map_err(|e| format!("SVG 파싱 실패: {}", e))?;
 
         // [Task #2264] 텍스트 임베드(폰트 서브셋)가 PDF 변환 메모리의 지배항이다.
         // `embed_text=false` 면 글리프를 path 로 변환해 서브셋 경로를 통째로 건너뛴다.
-        let mut conversion = svg2pdf::ConversionOptions::default();
-        conversion.embed_text = export_options.embed_text;
-
-        let (chunk, svg_ref) = svg2pdf::to_chunk(&tree, conversion)
-            .map_err(|e| format!("SVG→chunk 변환 실패: {:?}", e))?;
+        // [#3773] SubsetError 는 페이지 단위로 격리한다.
+        let Some((chunk, svg_ref)) =
+            convert_page_chunk(&tree, export_options.embed_text, page_index, &mut to_chunk)?
+        else {
+            continue;
+        };
 
         let dpi_ratio = 72.0 / 96.0; // 96 DPI → 72 pt
         let w = tree.size().width() * dpi_ratio;
@@ -739,6 +1035,10 @@ pub fn svgs_to_pdf_with_options(
             width: w,
             height: h,
         });
+    }
+
+    if page_datas.is_empty() {
+        return Err("모든 페이지의 SVG→PDF 변환이 SubsetError 로 건너뛰어졌습니다".to_string());
     }
 
     // 각 chunk를 재번호화하고 페이지 참조 수집
@@ -805,7 +1105,10 @@ pub fn svgs_to_pdf_with_options(
     pdf.document_info(info_ref)
         .producer(pdf_writer::TextStr("rhwp"));
 
-    Ok(pdf.finish())
+    // [#3824] 텍스트 표면만 표준 코드포인트로 맞춘다 — 렌더 결정은 불변.
+    let mut bytes = pdf.finish();
+    remap_pua_in_tounicode(&mut bytes);
+    Ok(bytes)
 }
 
 /// Record PageLayerTree pages directly into a native Skia PDF document.
@@ -901,6 +1204,59 @@ pub fn layer_trees_to_pdf_with_options(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// [#3824] ToUnicode 의 한컴 PUA 를 표준 코드포인트로 바꾸되 **길이를 보존**한다.
+    ///
+    /// 길이가 보존돼야 `/Length` 와 xref 오프셋을 건드리지 않는다 — 이 수정이
+    /// 바이트 수준에서 안전한 근거가 그것뿐이다.
+    #[test]
+    fn tounicode_pua_is_remapped_without_changing_length() {
+        // U+F02B1(사각 안 1)은 평면 15 라 UTF-16BE 서로게이트 쌍 DB80 DEB1 이다.
+        let src = b"beginbfchar
+<0001> <DB80DEB1>
+<0002> <DB80DEB2>
+endbfchar";
+        let mut buf = src.to_vec();
+        let before = buf.len();
+        remap_pua_in_tounicode(&mut buf);
+
+        assert_eq!(buf.len(), before, "길이가 바뀌면 /Length 와 xref 가 깨진다");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(
+            out.contains("<2460") && out.contains("<2461"),
+            "표준 원문자로 안 바뀌었다: {out}"
+        );
+        assert!(!out.contains("DB80"), "PUA 서로게이트가 남아 있다: {out}");
+    }
+
+    /// 뜻을 모르는 코드포인트는 손대지 않는다 — 매핑을 지어내지 않는다는 계약.
+    #[test]
+    fn tounicode_leaves_unmapped_codepoints_alone() {
+        let src = b"beginbfchar
+<0001> <AC00>
+<0002> <0041>
+endbfchar";
+        let mut buf = src.to_vec();
+        remap_pua_in_tounicode(&mut buf);
+        assert_eq!(buf, src.to_vec(), "매핑 없는 문자를 건드렸다");
+    }
+
+    /// `beginbfchar` 블록 **밖**은 건드리지 않는다 — 콘텐츠 스트림 오손 방지.
+    #[test]
+    fn tounicode_does_not_touch_bytes_outside_the_block() {
+        let src = b"<DB80DEB1> beginbfchar
+<0001> <DB80DEB1>
+endbfchar <DB80DEB1>";
+        let mut buf = src.to_vec();
+        remap_pua_in_tounicode(&mut buf);
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert_eq!(
+            out.matches("DB80DEB1").count(),
+            2,
+            "블록 밖 바이트까지 고쳤다: {out}"
+        );
+        assert!(out.contains("<2460"), "블록 안은 고쳐야 한다: {out}");
+    }
 
     #[test]
     fn pdf_backend_aliases_are_explicit() {

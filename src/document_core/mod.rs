@@ -12,6 +12,7 @@ pub mod converters;
 pub(crate) mod html_table_import;
 pub mod queries;
 pub mod table_calc;
+pub mod text_security;
 pub mod validation;
 
 use crate::model::document::Document;
@@ -146,6 +147,8 @@ pub struct DocumentCore {
     pub(crate) paste_cascade_count: u32,
     /// 문단부호(¶) 표시 여부
     pub(crate) show_paragraph_marks: bool,
+    /// [#4709] SVG 출력에 배치 메트릭 face 주석(data-metric-font) 부착 여부 (옵트인)
+    pub(crate) annotate_metric_font: bool,
     /// 조판부호 표시 여부 (개체 마커 [표]/[그림] 등, 문단부호 포함)
     pub(crate) show_control_codes: bool,
     /// 투명선 표시 여부
@@ -156,6 +159,10 @@ pub struct DocumentCore {
     pub(crate) debug_overlay: bool,
     /// LINE_SEG vpos-reset 강제 분리 적용 여부 (페이지네이션 옵션)
     pub(crate) respect_vpos_reset: bool,
+    /// 한글 2024 계열 조판 에뮬레이션 opt-in (세션 설정, CLI `--compat 2024`).
+    /// 문서 출처가 아니므로 provenance 가 아닌 여기서 들고,
+    /// [`Self::effective_layout_profile`] 이 profile 에 합성한다.
+    pub(crate) hangul2024_compat: bool,
     /// 구역별 표 측정 데이터 (페이지네이션 결과 보존)
     pub(crate) measured_tables: Vec<Vec<MeasuredTable>>,
     /// 구역별 dirty 플래그 (true = 재페이지네이션 필요)
@@ -256,11 +263,22 @@ impl DocumentCore {
         use crate::renderer::style_resolver::resolve_font_substitution;
 
         let mut fonts = std::collections::BTreeSet::new();
+        let mut font_substitutions = std::collections::BTreeSet::new();
         for (lang_idx, lang_fonts) in self.document.doc_info.font_faces.iter().enumerate() {
             for font in lang_fonts {
                 let resolved = resolve_font_substitution(&font.name, font.alt_type, lang_idx)
                     .unwrap_or(&font.name);
                 fonts.insert(resolved.to_string());
+                if let Some(substitute) = font
+                    .subst_font
+                    .as_ref()
+                    .filter(|substitute| !substitute.is_embedded)
+                    .filter(|substitute| !substitute.face.trim().is_empty())
+                    .filter(|substitute| substitute.face.trim() != resolved)
+                {
+                    font_substitutions
+                        .insert((resolved.to_string(), substitute.face.trim().to_string()));
+                }
             }
         }
         let fonts_json: Vec<String> = fonts
@@ -292,8 +310,10 @@ impl DocumentCore {
                 c => vec![c],
             })
             .collect();
+        let font_substitutions_json =
+            serde_json::to_string(&font_substitutions).unwrap_or_else(|_| "[]".to_string());
         format!(
-            "{{\"version\":\"{}.{}.{}.{}\",\"sectionCount\":{},\"pageCount\":{},\"encrypted\":{},\"hwp3Variant\":{},\"fallbackFont\":\"{}\",\"fontsUsed\":[{}]}}",
+            "{{\"version\":\"{}.{}.{}.{}\",\"sectionCount\":{},\"pageCount\":{},\"encrypted\":{},\"hwp3Variant\":{},\"fallbackFont\":\"{}\",\"fontsUsed\":[{}],\"fontSubstitutions\":{}}}",
             self.document.header.version.major,
             self.document.header.version.minor,
             self.document.header.version.build,
@@ -304,12 +324,39 @@ impl DocumentCore {
             self.document.layout_profile().hwp3_layout(),
             escaped_fallback,
             fonts_json.join(","),
+            font_substitutions_json,
         )
     }
 
     /// 이벤트 로그를 JSON 배열로 직렬화한다.
     pub fn serialize_event_log(&self) -> String {
         crate::model::event::serialize_event_log(&self.event_log)
+    }
+
+    /// 세션 설정(호환 모드)을 합성한 유효 레이아웃 프로필.
+    ///
+    /// 조판·레이아웃에 profile 을 공급하는 지점은 `document.layout_profile()`
+    /// 직접 호출 대신 이것을 쓴다. 출처 유도는 여전히
+    /// `Document::layout_profile` 이 단일 소유한다.
+    pub(crate) fn effective_layout_profile(
+        &self,
+    ) -> crate::model::provenance::LayoutCompatibilityProfile {
+        self.document
+            .layout_profile()
+            .with_hangul2024_layout(self.hangul2024_compat)
+    }
+
+    /// 한글 2024 계열 조판 에뮬레이션을 켜거나 끈다.
+    /// 변경 시 페이지네이션 결과가 달라지므로 모든 섹션을 재페이지네이션한다.
+    pub fn set_hangul2024_compat(&mut self, enabled: bool) {
+        if self.hangul2024_compat != enabled {
+            self.hangul2024_compat = enabled;
+            for d in self.dirty_sections.iter_mut() {
+                *d = true;
+            }
+            self.invalidate_page_tree_cache();
+            self.paginate();
+        }
     }
 
     /// DPI를 설정하고 스타일을 재해소한 후 재페이지네이션한다.
@@ -339,11 +386,13 @@ impl DocumentCore {
             table_transpose_clipboard: None,
             paste_cascade_count: 0,
             show_paragraph_marks: false,
+            annotate_metric_font: false,
             show_control_codes: false,
             show_transparent_borders: false,
             clip_enabled: true,
             debug_overlay: false,
             respect_vpos_reset: false,
+            hangul2024_compat: false,
             measured_tables: Vec::new(),
             dirty_sections: Vec::new(),
             measured_sections: Vec::new(),

@@ -153,6 +153,11 @@ pub struct PageContent {
     pub active_master_page: Option<MasterPageRef>,
     /// 확장 바탕쪽 (임의 쪽 등, 기본 바탕쪽에 추가로 적용)
     pub extra_master_pages: Vec<MasterPageRef>,
+    /// [#5699 H1] 이 쪽에서 typeset 이 "사다리-미계상 표 밴드" 자기모순을 판별해
+    /// 실높이로 교정한 표들 `(para_index, control_index)`. 렌더러는 이 표들 뒤의
+    /// 저장 vpos 후방 스냅을 페인트된 밴드 아래로 막는다 — typeset 판정과 렌더
+    /// 판정이 갈라지지 않도록 신호를 명시 전달한다(tac-img-02 비대칭 발동 실측).
+    pub ladder_band_tables: Vec<(usize, usize)>,
 }
 
 /// 바탕쪽 참조
@@ -369,6 +374,18 @@ pub enum FootnoteSource {
     },
 }
 
+/// 한 각주를 물리 페이지 경계에서 나눈 line fragment.
+///
+/// `start_line..end_line`은 각주 안의 문단을 순서대로 compose한 뒤의 평탄 line index다.
+/// `end_line`은 exclusive다. 첫 fragment만 separator와 번호를 그린다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FootnoteFragment {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub draw_separator: bool,
+    pub draw_number: bool,
+}
+
 /// 페이지에 배치되는 각주 참조
 #[derive(Debug, Clone)]
 pub struct FootnoteRef {
@@ -376,6 +393,8 @@ pub struct FootnoteRef {
     pub number: u16,
     /// 출처
     pub source: FootnoteSource,
+    /// `None`이면 각주 전체를 그린다.
+    pub fragment: Option<FootnoteFragment>,
 }
 
 /// 한 단(Column)에 배치될 콘텐츠
@@ -410,6 +429,30 @@ pub struct ColumnContent {
     /// layout 시점까지 보존. layout 이 본 메타데이터로 wrap zone 판정 + LineSeg cs/sw
     /// 정합 렌더 (PR #589 wrap_precomputed 메커니즘 대체).
     pub wrap_anchors: std::collections::HashMap<usize, WrapAnchorRef>,
+    /// [#4568] 앞 쪽에서 쪽 하단에 잘린 overlay 표의 **잔여 행**을 이 단 최상단에
+    /// 이어 그리기 위한 목록.
+    ///
+    /// `items` 에 섞지 않는 이유는 소유 의미가 다르기 때문이다 — 잔여 행은 흐름을
+    /// 소비하지 않는 z-layer 장식이고 이 단이 그 문단을 소유하지도 않는다. 항목으로
+    /// 넣으면 이 조각이 단의 **첫 항목**이 되어 `items.first()` 를 보는 휴리스틱들이
+    /// 조각을 본문으로 읽는다(실측: `overflow_cell_baseline` 래칫 62 → 63줄).
+    pub overlay_continuations: Vec<OverlayContinuation>,
+    /// [#4568] 이 단에서 잔여 행을 다음 쪽에 넘긴 overlay 표의 **앵커 쪽 컷**.
+    /// `(para_index, control_index, end_row)` — 앵커 그리기는 `0..end_row` 만 그린다.
+    /// 넘긴 행을 앵커 쪽에서도 전부 그리면(bleed) 시각적으로는 클립돼 안 보이지만
+    /// render tree 에 쪽 밖 줄이 남아 `overflow_cell_baseline` 래칫에 계상된다.
+    pub overlay_cuts: Vec<(usize, usize, usize)>,
+}
+
+/// [#4568] 쪽을 넘긴 overlay 표의 잔여 행 조각.
+#[derive(Debug, Clone)]
+pub struct OverlayContinuation {
+    /// 표 컨트롤이 있는 원본 문단 인덱스
+    pub para_index: usize,
+    /// 문단 내 컨트롤 인덱스
+    pub control_index: usize,
+    /// 이 단에서 그릴 첫 행 (inclusive). 앞 쪽이 이미 그린 행 수와 같다.
+    pub start_row: usize,
 }
 
 /// 어울림 배치 표 옆에 배치되는 빈 리턴 문단 정보
@@ -421,6 +464,10 @@ pub struct WrapAroundPara {
     pub table_para_index: usize,
     /// 텍스트가 있는 문단인지 (false면 빈 리턴)
     pub has_text: bool,
+    /// 표 옆 띠에서 렌더할 첫 줄(포함).
+    pub start_line: usize,
+    /// 표 옆 띠에서 렌더할 끝 줄(제외). `usize::MAX`는 전체 줄을 뜻한다.
+    pub end_line: usize,
 }
 
 /// [Task #604 R3] anchor 그림/표 ↔ wrap text 문단 매칭 메타데이터.
@@ -488,6 +535,22 @@ pub enum PageItem {
         /// (`advance_row_block_cut`). false 이면 단일 행 `row_span==1` col 인덱스
         /// (`advance_row_cut`, 기존). page-larger 셀 내부 분할에서만 true.
         is_block_split: bool,
+        /// [Issue #4326] `start_row`/`end_row`/`start_cut`/`end_cut`이 가리키는 좌표계.
+        /// true면 투명 1×1 래퍼를 벗긴 중첩 표(측정기·`row_geometry_table`이 실제로 쓰는
+        /// 표) 기준이고, false면 이 항목이 참조하는 바깥 `para_index`/`control_index`
+        /// 표 자신의 행 도메인 기준이다. 렌더러가 값(`end_row <= table.row_count`)으로
+        /// 되추론하던 것을 페이지네이션 결정 시점에 데이터로 고정한다.
+        row_cursor_is_nested: bool,
+        /// RowBreak 표에서 이전 rowspan이 닿는 마지막 행을 현재 조각의 남은
+        /// 물리 높이에 맞춰 배치해야 할 때의 마지막 행 높이 상한(px).
+        ///
+        /// 내용은 이미 이 조각에 모두 소비됐지만 선언 행 높이만 남은 공간보다
+        /// 큰 경우에만 사용한다. 다음 조각은 끝행의 full cut으로 재진입해 남은
+        /// 빈 밴드만 소비하므로, 이 값은 cursor/cut 계약과 짝을 이룬다.
+        end_row_height_override: Option<f64>,
+        /// 직전 조각에서 내용이 모두 소비된 시작 행의 남은 빈 물리 밴드 높이(px).
+        /// `start_cut`은 해당 셀 내용을 숨기고 이 값은 테두리/셀 기하만 보존한다.
+        start_row_height_override: Option<f64>,
     },
     /// 그리기 개체
     Shape {
@@ -527,16 +590,7 @@ pub fn find_inline_control_target_page(
     ctrl_idx: usize,
     para: &Paragraph,
 ) -> Option<(usize, usize)> {
-    let positions = para.control_text_positions();
-    let ctrl_text_pos = *positions.get(ctrl_idx)?;
-    let target_line = para
-        .line_segs
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, ls)| (ls.text_start as usize) <= ctrl_text_pos)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    let target_line = crate::renderer::layout::control_line_seg_index(para, ctrl_idx)?;
 
     // 1) 현재(마지막) 페이지의 current_items 검사 — 박스 line 이 여기 있으면 None (= 현재)
     let in_current = current_items.iter().any(|item| match item {
@@ -572,6 +626,19 @@ pub fn find_inline_control_target_page(
         }
     }
     None
+}
+
+/// 페이지로 분할된 문단에서 해당 줄을 소유한 쪽으로 다시 배치해야 하는 인라인 개체인가.
+///
+/// `PageItem::Shape`는 개체 종류를 함께 담지만, 실제 그림/도형의 인라인 좌표는 문단의
+/// 일부 줄만 렌더한 쪽에 등록된다. 문단 끝에서 일괄 추가하면 모든 TAC 그림이 마지막
+/// 조각으로 몰린다. 표·수식은 별도 조판 경로와 소유 규칙을 가지므로 여기서 넓히지 않는다.
+pub(crate) fn is_routable_treat_as_char_picture_or_shape(control: &Control) -> bool {
+    match control {
+        Control::Picture(picture) => picture.common.treat_as_char,
+        Control::Shape(shape) => shape.common().treat_as_char,
+        _ => false,
+    }
 }
 
 impl PageItem {
@@ -619,6 +686,9 @@ impl PageItem {
                 start_cut,
                 end_cut,
                 is_block_split,
+                row_cursor_is_nested,
+                end_row_height_override,
+                start_row_height_override,
             } => PageItem::PartialTable {
                 para_index: adjust(*para_index),
                 control_index: *control_index,
@@ -628,6 +698,9 @@ impl PageItem {
                 start_cut: start_cut.clone(),
                 end_cut: end_cut.clone(),
                 is_block_split: *is_block_split,
+                row_cursor_is_nested: *row_cursor_is_nested,
+                end_row_height_override: *end_row_height_override,
+                start_row_height_override: *start_row_height_override,
             },
             PageItem::Shape {
                 para_index,
@@ -772,6 +845,8 @@ impl PaginationResult {
                         start_height: cc.start_height,
                         endnote_flow: cc.endnote_flow,
                         items: cc.items.iter().map(|it| it.with_offset(offset)).collect(),
+                        overlay_continuations: cc.overlay_continuations.clone(),
+                        overlay_cuts: cc.overlay_cuts.clone(),
                         zone_layout: cc.zone_layout.clone(),
                         zone_y_offset: cc.zone_y_offset,
                         wrap_around_paras: cc
@@ -782,6 +857,8 @@ impl PaginationResult {
                                 table_para_index: (w.table_para_index as i64 + offset as i64).max(0)
                                     as usize,
                                 has_text: w.has_text,
+                                start_line: w.start_line,
+                                end_line: w.end_line,
                             })
                             .collect(),
                         used_height: cc.used_height,
@@ -849,11 +926,13 @@ impl PaginationResult {
                         FootnoteRef {
                             number: f.number,
                             source,
+                            fragment: f.fragment,
                         }
                     })
                     .collect(),
                 active_master_page: old_page.active_master_page.clone(),
                 extra_master_pages: old_page.extra_master_pages.clone(),
+                ladder_band_tables: old_page.ladder_band_tables.clone(),
             };
             // hidden_empty_paras는 별도 처리
             self.pages.push(new_page);
@@ -871,6 +950,8 @@ impl PaginationResult {
                     para_index: shifted_pi,
                     table_para_index: shifted_tpi,
                     has_text: w.has_text,
+                    start_line: w.start_line,
+                    end_line: w.end_line,
                 });
             }
         }

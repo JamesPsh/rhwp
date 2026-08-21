@@ -34,6 +34,7 @@ pub struct ResourceArena {
     font_blob_bytes: Vec<Vec<u8>>,
     font_blob_hashes: Vec<u64>,
     font_blob_fingerprints: Vec<[u8; 16]>,
+    font_blob_resource_keys: Vec<String>,
     font_blob_lookup: HashMap<u64, Vec<FontBlobResourceId>>,
     font_blob_ref_lookup: HashMap<String, FontBlobResourceId>,
     font_resources: FontResourceTable,
@@ -167,6 +168,7 @@ impl ResourceArena {
         self.font_blob_bytes.push(bytes.to_vec());
         self.font_blob_hashes.push(hash);
         self.font_blob_fingerprints.push(fingerprint);
+        self.font_blob_resource_keys.push(resource_key.clone());
         self.font_blob_lookup.entry(hash).or_default().push(id);
         self.font_blob_ref_lookup.insert(resource_key, id);
         id
@@ -186,6 +188,10 @@ impl ResourceArena {
 
     pub fn font_blob_fingerprint(&self, id: FontBlobResourceId) -> Option<[u8; 16]> {
         self.font_blob_fingerprints.get(id.0).copied()
+    }
+
+    pub fn font_blob_resource_key(&self, id: FontBlobResourceId) -> Option<&str> {
+        self.font_blob_resource_keys.get(id.0).map(String::as_str)
     }
 
     pub fn font_blob_resources(&self) -> impl Iterator<Item = (FontBlobResourceId, &[u8])> + '_ {
@@ -269,15 +275,66 @@ pub fn source_image_key(
         return None;
     }
 
+    // 술어는 `image_resolver::is_watermark_image` 가 단일 권위다 — 여기서 사본을 들면
+    // 키가 가리키는 바이트와 실제로 내보내는 바이트가 조용히 갈라진다 (#3315).
     let bakes_watermark = crate::renderer::image_resolver::detect_image_mime_type(data)
         == "image/jpeg"
-        && !matches!(image.effect, crate::model::image::ImageEffect::RealPic)
-        && (image.brightness != 0 || image.contrast != 0);
-    let variant = if bakes_watermark { "wmpng" } else { "src" };
+        && crate::renderer::image_resolver::is_watermark_image(image);
+    let variant = if bakes_watermark {
+        SourceImageVariant::BakedWatermarkPng
+    } else {
+        SourceImageVariant::Source
+    };
     Some(format!(
-        "bin:{bin_data_epoch}:{}:{variant}",
-        image.bin_data_id
+        "bin:{bin_data_epoch}:{}:{}",
+        image.bin_data_id,
+        variant.as_str()
     ))
+}
+
+/// `source_image_key` 의 variant — 같은 원본에서 다른 바이트가 나오는 갈림 (Task #3315).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceImageVariant {
+    /// 원본 바이트. 브라우저가 못 읽는 포맷(BMP/PCX/TIFF/회색 JPEG)이면 PNG 변환까지.
+    Source,
+    /// JPEG 워터마크를 한컴 규칙으로 bake 한 PNG.
+    BakedWatermarkPng,
+}
+
+impl SourceImageVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceImageVariant::Source => "src",
+            SourceImageVariant::BakedWatermarkPng => "wmpng",
+        }
+    }
+
+    pub fn bakes_watermark(self) -> bool {
+        matches!(self, SourceImageVariant::BakedWatermarkPng)
+    }
+}
+
+/// `source_image_key` 가 만든 키를 되읽는다 (Task #3315).
+///
+/// 발급과 해석을 같은 모듈에 묶는다 — 소비자가 문자열을 직접 쪼개게 두면 접두어나 variant
+/// 를 바꿀 때 조용히 어긋난다. 모르는 variant 는 받아들이지 않는다: `src` 로 넘겨 버리면
+/// 워터마크 그림에 원본 JPEG 을 돌려주고도 성공한 것처럼 보인다.
+pub fn parse_source_image_key(key: &str) -> Option<(u32, u16, SourceImageVariant)> {
+    let mut parts = key.split(':');
+    if parts.next()? != "bin" {
+        return None;
+    }
+    let epoch = parts.next()?.parse::<u32>().ok()?;
+    let bin_data_id = parts.next()?.parse::<u16>().ok()?;
+    let variant = match parts.next()? {
+        "src" => SourceImageVariant::Source,
+        "wmpng" => SourceImageVariant::BakedWatermarkPng,
+        _ => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((epoch, bin_data_id, variant))
 }
 
 pub fn svg_resource_key(byte_len: usize, digest: &str) -> String {
@@ -356,6 +413,11 @@ mod tests {
             arena.font_blob_fingerprint(font_a),
             Some(resource_fingerprint([5, 6, 7, 8]))
         );
+        let font_key = font_blob_resource_key(4, &resource_digest_hex([5, 6, 7, 8]));
+        assert_eq!(
+            arena.font_blob_resource_key(font_a),
+            Some(font_key.as_str())
+        );
         assert_eq!(
             arena.font_blob_resources().collect::<Vec<_>>(),
             vec![(FontBlobResourceId(0), &[5, 6, 7, 8][..])]
@@ -422,6 +484,14 @@ mod tests {
 
         image.effect = ImageEffect::GrayScale;
         image.brightness = 1;
+        assert_eq!(
+            source_image_key(3, &image).as_deref(),
+            Some("bin:3:7:wmpng")
+        );
+
+        // 밝기와 명암 중 하나만 바뀌어도 기존 bake 술어는 같은 variant를 발급한다.
+        image.brightness = 0;
+        image.contrast = 1;
         assert_eq!(
             source_image_key(3, &image).as_deref(),
             Some("bin:3:7:wmpng")

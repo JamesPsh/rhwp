@@ -7,6 +7,7 @@ import { PageRenderer, type PageRenderContext, type PageRenderResult } from './p
 import { ViewportManager } from './viewport-manager';
 import { CoordinateSystem } from './coordinate-system';
 import type { CanvasKitRenderDiagnostics } from './canvaskit-renderer';
+import type { FontDecisionTraceRecordV1 } from '@/core/font-decision-trace';
 import { clampRenderScale, type RenderBackend } from './render-backend';
 import {
   RendererSession,
@@ -22,7 +23,9 @@ import {
   type ZoomAnchor,
   type ZoomPageBox,
 } from './zoom-anchor.ts';
-import { SubsecondRevisionWatcher } from '@/core/subsecond-runtime';
+
+/** 문서 교체 중 보여줄 빈 쪽 기본 크기(A4, zoom 1 기준 CSS px). 이전 문서 쪽 크기를 모를 때만 쓴다. */
+const BLANK_PAGE_FALLBACK_SIZE = { width: 794, height: 1123 };
 
 const TEXT_EDIT_STATIC_LAYER_VERIFY_DELAY_MS = 800;
 const AUTO_RENDERER_RESELECTION_DELAY_MS = 300;
@@ -42,7 +45,6 @@ export class CanvasView {
   private pageRenderer: PageRenderer;
   private viewportManager: ViewportManager;
   private coordinateSystem: CoordinateSystem;
-  private subsecondRevisionWatcher: SubsecondRevisionWatcher;
 
   private scrollContent: HTMLElement;
   private pages: PageInfo[] = [];
@@ -59,6 +61,8 @@ export class CanvasView {
   private autoRendererReselectionTimer: ReturnType<typeof setTimeout> | null = null;
   private documentLoadPrepared = false;
   private layoutViewportSize = { width: 0, height: 0 };
+  private blankPagePlaceholder: HTMLElement | null = null;
+  private lastPageSize: { width: number; height: number } | null = null;
   private disposed = false;
 
   constructor(
@@ -72,11 +76,6 @@ export class CanvasView {
     this.pageRenderer = new PageRenderer(wasm);
     this.viewportManager = new ViewportManager(eventBus);
     this.coordinateSystem = new CoordinateSystem(this.virtualScroll);
-    this.subsecondRevisionWatcher = new SubsecondRevisionWatcher(
-      wasm,
-      () => eventBus.emit('document-view-changed', 'subsecond-renderer'),
-    );
-    this.subsecondRevisionWatcher.start();
 
     this.scrollContent = container.querySelector('#scroll-content')!;
     this.viewportManager.attachTo(container);
@@ -95,14 +94,13 @@ export class CanvasView {
       eventBus.on('document-page-invalidated', (payload) => {
         void this.refreshInvalidatedPageForMutation(payload);
       }),
-      eventBus.on('document-changed', () => {
+      eventBus.on('document-changed', (reason) => {
+        // document-agent는 host 응답 전 strict render를 이미 완료한다. 나머지 observer에는
+        // commit event를 전달하되 CanvasView만 같은 revision을 두 번 그리지 않는다.
+        if (reason === 'document-agent-rendered') return;
         void this.refreshPagesForMutation();
       }),
-      eventBus.on('document-view-changed', (source) => {
-        if (source === 'subsecond-renderer') {
-          this.refreshPages();
-          return;
-        }
+      eventBus.on('document-view-changed', () => {
         void this.refreshPagesForRevision();
       }),
       eventBus.on('grid-view-changed', () => this.refreshGridOverlays()),
@@ -155,7 +153,9 @@ export class CanvasView {
     );
 
     this.container.scrollTop = 0;
+    this.lastPageSize = { width: this.pages[0].width, height: this.pages[0].height };
     this.updateVisiblePages();
+    this.clearBlankPagePlaceholder();
     // 초기 replay가 예약한 document fallback을 load 완료 전에 확정한다.
     await Promise.resolve();
 
@@ -170,8 +170,53 @@ export class CanvasView {
     this.cancelAutoRendererReselection();
     this.rendererFallbackScheduled = false;
     this.rendererSession.beginDocument(this.wasm.documentDigest);
+    // [#3315] 문서 범위 object URL 도 같은 경계에서 넘긴다 — 새 문서가 flow 그림을 조회하지
+    // 않으면 옛 문서의 URL 을 거둘 기회가 다시 오지 않는다.
+    this.pageRenderer.beginDocument();
     this.activeRendererDecisionKey = null;
     this.reset();
+    this.showBlankPagePlaceholder();
+  }
+
+  /**
+   * 문서 열기를 시작할 때 현재 뷰를 비우고 빈 쪽 상태로 만든다. 파싱이 끝날 때까지
+   * 이전 문서를 붙잡고 있다가 한 번에 갈아치우면 화면이 튀어 보인다.
+   */
+  showBlankPage(): void {
+    if (this.disposed) return;
+    this.reset();
+    this.showBlankPagePlaceholder();
+  }
+
+  /**
+   * 새 문서의 첫 쪽이 그려질 때까지 빈 흰 쪽을 대신 놓는다. 자리표시자가 없으면 회색 작업
+   * 영역이 그대로 드러나 문서를 열 때마다 화면이 깜빡이는 것처럼 보인다.
+   */
+  private showBlankPagePlaceholder(): void {
+    if (this.disposed) return;
+    const zoom = this.viewportManager.getZoom();
+    const size = this.lastPageSize ?? BLANK_PAGE_FALLBACK_SIZE;
+    const gap = this.virtualScroll.getPageGap();
+    const width = size.width * zoom;
+    const height = size.height * zoom;
+
+    const placeholder = document.createElement('div');
+    placeholder.className = 'page-placeholder';
+    placeholder.setAttribute('aria-hidden', 'true');
+    placeholder.style.top = `${gap}px`;
+    placeholder.style.width = `${width}px`;
+    placeholder.style.height = `${height}px`;
+
+    // 자리표시자만 있는 동안에도 스크롤 영역이 쪽 하나 크기를 유지해야 가운데 정렬이 흔들리지 않는다.
+    this.scrollContent.style.width = `${width + 40}px`;
+    this.scrollContent.style.height = `${height + gap * 2}px`;
+    this.scrollContent.appendChild(placeholder);
+    this.blankPagePlaceholder = placeholder;
+  }
+
+  private clearBlankPagePlaceholder(): void {
+    this.blankPagePlaceholder?.remove();
+    this.blankPagePlaceholder = null;
   }
 
   resetRendererDiagnostics(): void {
@@ -188,6 +233,22 @@ export class CanvasView {
     const selected = await this.selectMutationRevision();
     if (!selected || !this.rendererSession.isCurrent(selected.selection)) return;
     this.refreshPages();
+  }
+
+  /** document-agent RPC 응답 전에 현재 visible page가 실제 canvas로 그려졌는지 확인한다. */
+  async refreshDocumentAgentMutation(): Promise<void> {
+    const selected = await this.selectMutationRevision();
+    if (!selected || !this.rendererSession.isCurrent(selected.selection)) {
+      throw new Error('document-agent renderer revision을 선택하지 못했습니다.');
+    }
+    this.refreshPages();
+    const scrollY = this.viewportManager.getScrollY();
+    const viewport = this.viewportManager.getViewportSize();
+    const visiblePages = this.virtualScroll.getVisiblePages(scrollY, viewport.height);
+    const failed = visiblePages.filter(pageIndex => !this.canvasPool.has(pageIndex));
+    if (visiblePages.length === 0 || failed.length > 0) {
+      throw new Error(`document-agent visible page render 실패: ${failed.join(',') || 'none'}`);
+    }
   }
 
   private async refreshInvalidatedPageForMutation(payload: unknown): Promise<void> {
@@ -291,6 +352,43 @@ export class CanvasView {
 
     // 그리드 모드 CSS 클래스 토글
     this.scrollContent.classList.toggle('grid-mode', this.virtualScroll.isGridMode());
+
+    // [#3377] 좌표계가 바뀌어도 기렌더 캔버스·오버레이는 renderCanvas 밖에서 재배치되지
+    // 않아, 첫 로딩 중 스크롤바 등장(clientWidth −15px) 같은 재계산 뒤에 신·구 좌표계가
+    // 공존했다. 활성 페이지 전체에 현재 좌표를 재적용한다. 줌 애니메이션 중에는 preview
+    // 변환(scale 동반)이 위치를 관리하므로 그 경로를 재사용한다.
+    if (this.viewportManager.isZoomAnimating()) {
+      this.updateRenderedPageZoomPreview();
+    } else {
+      this.repositionActivePages();
+    }
+  }
+
+  /** 페이지 요소(캔버스·오버레이)에 현재 레이아웃 좌표를 적용하는 단일 관문. */
+  private positionPageElement(element: HTMLElement, pageIdx: number): void {
+    element.style.top = `${this.virtualScroll.getPageOffset(pageIdx)}px`;
+
+    // 그리드/광폭 팬: 고정 left 좌표, 단일 열: CSS 중앙 정렬
+    const pageLeft = this.virtualScroll.getPageLeft(pageIdx);
+    if (pageLeft >= 0) {
+      element.style.left = `${pageLeft}px`;
+      element.style.transform = 'none';
+    } else {
+      element.style.left = '50%';
+      element.style.transform = 'translateX(-50%)';
+    }
+    element.style.transformOrigin = '';
+  }
+
+  /** [#3377] 이미 렌더된 페이지의 캔버스와 오버레이를 현재 레이아웃 좌표로 재배치한다. */
+  private repositionActivePages(): void {
+    for (const pageIdx of this.canvasPool.activePages) {
+      const canvas = this.canvasPool.getCanvas(pageIdx);
+      if (canvas) this.positionPageElement(canvas, pageIdx);
+      this.scrollContent.querySelectorAll<HTMLElement>(
+        `[data-rhwp-overlay-page="${pageIdx}"], [data-rhwp-grid-page="${pageIdx}"]`,
+      ).forEach((element) => this.positionPageElement(element, pageIdx));
+    }
   }
 
   /** 스크롤/리사이즈 시 보이는 페이지를 갱신한다 */
@@ -417,18 +515,7 @@ export class CanvasView {
     const dpr = renderScale / (zoom > 0 ? zoom : 1);
 
     // Canvas를 DOM에 추가하고 위치를 설정한다
-    canvas.style.top = `${this.virtualScroll.getPageOffset(pageIdx)}px`;
-
-    // 그리드 모드: 고정 left 좌표, 단일 열: CSS 중앙 정렬
-    const pageLeft = this.virtualScroll.getPageLeft(pageIdx);
-    if (pageLeft >= 0) {
-      canvas.style.left = `${pageLeft}px`;
-      canvas.style.transform = 'none';
-    } else {
-      canvas.style.left = '50%';
-      canvas.style.transform = 'translateX(-50%)';
-    }
-    canvas.style.transformOrigin = '';
+    this.positionPageElement(canvas, pageIdx);
 
     // WASM이 Canvas 크기를 자동 설정한다 (물리 픽셀 = 페이지크기 × zoom × DPR)
     let renderResult: PageRenderResult = { needsTextEditStaticLayerVerification: false };
@@ -556,7 +643,7 @@ export class CanvasView {
         CENTER_ZOOM_ANCHOR,
         nextViewport,
       );
-      this.viewportManager.setScrollLeft(nextScroll.scrollLeft);
+      this.viewportManager.setScrollLeft(this.clampScrollLeft(nextScroll.scrollLeft));
       this.viewportManager.setScrollTop(nextScroll.scrollTop);
     } else {
       this.viewportManager.setScrollLeft(
@@ -572,6 +659,20 @@ export class CanvasView {
       this.pageRenderer.cancelAll();
     }
     this.updateVisiblePages();
+  }
+
+  /**
+   * [#3591] 앵커 계산 결과를 실제 스크롤 가능 범위로 가둔다.
+   *
+   * 팬 여백이 창 폭 100% 이던 시절에는 오버슈트를 여백이 흡수했지만, 여백이
+   * 얇아지면 계산값이 범위를 넘을 수 있다(브라우저는 대입 시 클램프하므로 화면은
+   * 안전하나, 이후 계산이 어긋난 값을 근거로 삼는 것을 막는다). 콘텐츠가 창보다
+   * 좁으면 스크롤 여지가 없으므로 0 이다.
+   */
+  private clampScrollLeft(value: number): number {
+    const viewportWidth = this.viewportManager.getViewportSize().width;
+    const maxScroll = Math.max(0, this.virtualScroll.getTotalWidth() - viewportWidth);
+    return Math.max(0, Math.min(value, maxScroll));
   }
 
   private getZoomPageBox(pageIdx: number, viewportWidth: number): ZoomPageBox {
@@ -610,7 +711,7 @@ export class CanvasView {
       },
       anchor,
     );
-    this.viewportManager.setScrollLeft(nextScroll.scrollLeft);
+    this.viewportManager.setScrollLeft(this.clampScrollLeft(nextScroll.scrollLeft));
     this.viewportManager.setScrollTop(nextScroll.scrollTop);
 
     this.eventBus.emit('zoom-level-display', zoom);
@@ -698,9 +799,44 @@ export class CanvasView {
       typeof payload === 'object' && payload !== null && 'reason' in payload
         ? (payload as { reason?: unknown }).reason
         : undefined;
+    const focusedPagePatch =
+      typeof payload === 'object' && payload !== null && 'focusedPagePatch' in payload
+        ? (payload as { focusedPagePatch?: unknown }).focusedPagePatch
+        : undefined;
+    const validFocusedPagePatch = (() => {
+      if (!focusedPagePatch || typeof focusedPagePatch !== 'object') return undefined;
+      const candidate = focusedPagePatch as {
+        pageIndex?: unknown;
+        x?: unknown;
+        y?: unknown;
+        width?: unknown;
+        height?: unknown;
+      };
+      const numbers = [candidate.x, candidate.y, candidate.width, candidate.height];
+      if (
+        !Number.isSafeInteger(candidate.pageIndex)
+        || candidate.pageIndex !== pageIndex
+        || !numbers.every((value) => typeof value === 'number' && Number.isFinite(value))
+        || (candidate.width as number) <= 0
+        || (candidate.height as number) <= 0
+      ) {
+        return undefined;
+      }
+      return {
+        pageIndex: candidate.pageIndex as number,
+        x: candidate.x as number,
+        y: candidate.y as number,
+        width: candidate.width as number,
+        height: candidate.height as number,
+      };
+    })();
     const renderContext: PageRenderContext =
       reason === 'text-edit'
-        ? { reason: 'text-edit', allowStaticOverlayReuse: true }
+        ? {
+            reason: 'text-edit',
+            allowStaticOverlayReuse: true,
+            ...(validFocusedPagePatch ? { focusedPagePatch: validFocusedPagePatch } : {}),
+          }
         : { reason: 'unknown', allowStaticOverlayReuse: false };
 
     if (!Number.isInteger(pageIndex) || pageIndex < 0) {
@@ -810,6 +946,7 @@ export class CanvasView {
     this.currentVisiblePages = [];
     this.pages = [];
     this.scrollContent.replaceChildren();
+    this.blankPagePlaceholder = null;
   }
 
   private releaseAllRenderedPages(): void {
@@ -868,11 +1005,25 @@ export class CanvasView {
       .forEach((el) => el.remove());
   }
 
-  /** 전체 정리 */
+  /**
+   * 뷰가 쥔 것을 전부 놓는다 — 감시자, 렌더러 세션, 뷰포트 청취, 이벤트 구독.
+   *
+   * **호출부가 없는 것이 지금의 계약이다** (#4592). `canvasView` 는 `main.ts` 모듈 바인딩이고
+   * 한 번 만들어진 뒤 교체되지 않는다. 스튜디오에는 문서 닫기도 뷰 교체도 없으므로 이 뷰의
+   * 수명은 realm 과 같고, 탭이 닫히면 감시자·구독·wasm 핸들이 함께 사라진다. 그래서 지금
+   * 누수는 없다 — 없는 것은 해체 **경로**이지 해체 **구현**이 아니다.
+   *
+   * `pagehide`/`beforeunload` 에 걸지 않는다. **적극적으로 해롭다** — bfcache 로 복원되는
+   * 페이지에서 폐기된 뷰가 되살아나고, 어차피 realm 이 사라지는 시점의 해제는 의식일 뿐이다.
+   * #4579 가 같은 이유로 배선을 거절했다.
+   *
+   * 이 메서드와 `disposed` 가드들이 살아나는 시점은 하나뿐이다: 문서 닫기나 뷰 교체 기능이
+   * 생길 때. 개발용 렌더 런타임은 `main.ts`가 realm 단위로 소유하므로, 그 새 수명 경로에서
+   * 반환된 해제 함수를 함께 부른다. 그 전까지 호출부를 지어내지 않는다.
+   */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.subsecondRevisionWatcher.stop();
     this.rendererSelectionEpoch += 1;
     this.documentLoadPrepared = false;
     this.cancelAutoRendererReselection();
@@ -894,6 +1045,15 @@ export class CanvasView {
     return this.viewportManager;
   }
 
+  /** 전역 쪽 번호를 뷰포트 상단으로 이동한다. */
+  gotoPage(pageIndex: number): boolean {
+    if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= this.virtualScroll.pageCount) {
+      return false;
+    }
+    this.viewportManager.setScrollTop(this.virtualScroll.getPageOffset(pageIndex));
+    return true;
+  }
+
   getRenderBackend(): RenderBackend {
     return this.pageRenderer.getBackend();
   }
@@ -908,6 +1068,10 @@ export class CanvasView {
 
   getCurrentCanvasKitRenderDiagnostics(): CanvasKitRenderDiagnostics | null {
     return this.pageRenderer.getCurrentCanvasKitRenderDiagnostics();
+  }
+
+  getCanvasKitFontDecisionEvidence(pageIndex: number, record: FontDecisionTraceRecordV1) {
+    return this.pageRenderer.getCanvasKitFontDecisionEvidence(pageIndex, record);
   }
 
   getCoordinateSystem(): CoordinateSystem {

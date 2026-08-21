@@ -1,7 +1,13 @@
-import type { RemovedParaMeta, WasmBridge } from '@/core/wasm-bridge';
+import type {
+  DeferredCellTextMutationResult,
+  DeferredFocusedPagePatch,
+  RemovedParaMeta,
+  WasmBridge,
+} from '@/core/wasm-bridge';
 import type { DocumentPosition, CharProperties, ParaProperties, CellPathLike, CellPathEntry } from '@/core/types';
 import { MAX_PAGE_LOCAL_TEXT_EDIT_CHARS } from './input-edit-invalidation';
 import type { LineEndpoints as LineEndpointsLike } from './object-drag-record';
+import { setObjectProps, type ObjectPropsRef } from './object-props';
 
 /** 편집 명령 공통 인터페이스 */
 export interface EditCommand {
@@ -38,6 +44,24 @@ export interface EditCommand {
    * 시 이 값을 읽어 HF/FN 모드 재진입 + 커서 위치를 복원하고 본문 moveTo 를 건너뛴다.
    */
   editContext?(): EditContext | null;
+  /**
+   * [Task #3416] 이 명령이 실행되기 **직전의 선택 범위**. undo 후 그 선택을 되살리는 데 쓴다.
+   *
+   * 한컴 2024 실측: 선택을 지운 뒤 undo 하면 지우기 전 범위가 그대로 복원되고(캐럿은 선택 끝),
+   * redo 하면 해제된다. 반면 선택 위에 타이핑해서 대체한 경우의 undo 는 복원하지 않는다.
+   * F3 블록 선택은 **확장 단계까지** 되돌아온다 — undo 뒤 F3 를 누르면 단어에서 문단으로
+   * 이어서 확장한다(단계가 초기화됐다면 다시 단어 범위에 머물렀을 것이다).
+   * 그래서 이것은 **선택 삭제 계열만 구현한다** — 미구현이면 종전대로 해제된다.
+   *
+   * 반환값은 "그때 그랬다" 는 기록일 뿐 지금 유효하다는 보장이 아니다. 복원하는 쪽이 현재
+   * 문서에서 유효한지 반드시 확인해야 한다(#2339).
+   */
+  selectionBefore?(): {
+    start: DocumentPosition;
+    end: DocumentPosition;
+    /** F3 블록 선택이었으면 그 확장 단계, 아니면 `null` (실측: 한컴은 단계까지 되돌린다). */
+    blockPhase: number | null;
+  } | null;
 }
 
 /**
@@ -66,10 +90,20 @@ export type EditContext =
     };
 
 /** text mutation의 document pagination/flow 경계와 immediate 완료를 함께 전달한다. */
+export interface FocusedCellCursorGeometry {
+  readonly baseRevision: number;
+  readonly revision: number;
+  readonly source: DocumentPosition;
+  readonly target: DocumentPosition;
+  readonly deltaX: number;
+}
+
 export interface TextMutationEffects {
   readonly documentPaginationPending: boolean;
   readonly flowChanged: boolean;
   readonly paginationCompleted: boolean;
+  readonly focusedCursorGeometry?: FocusedCellCursorGeometry;
+  readonly focusedPagePatch?: DeferredFocusedPagePatch;
 }
 
 export const NO_TEXT_MUTATION_EFFECTS: TextMutationEffects = Object.freeze({
@@ -89,11 +123,31 @@ export class TextMutationEffectAccumulator {
   private effects: TextMutationEffects = NO_TEXT_MUTATION_EFFECTS;
 
   add(effects: TextMutationEffects): void {
+    const accumulatedMutation = this.effects.documentPaginationPending
+      || this.effects.flowChanged
+      || this.effects.paginationCompleted;
+    const incomingMutation = effects.documentPaginationPending
+      || effects.flowChanged
+      || effects.paginationCompleted;
+    // 두 mutation을 한 번에 묶으면 중간 source rect를 보장할 수 없다. 단일 mutation이거나
+    // 앞뒤가 NO effect인 경우에만 focused geometry를 전달한다.
+    const focusedCursorGeometry = accumulatedMutation
+      ? (incomingMutation ? undefined : this.effects.focusedCursorGeometry)
+      : (incomingMutation ? effects.focusedCursorGeometry : undefined);
+    const focusedPagePatch = accumulatedMutation
+      ? (
+          incomingMutation
+            ? mergeFocusedPagePatches(this.effects.focusedPagePatch, effects.focusedPagePatch)
+            : this.effects.focusedPagePatch
+        )
+      : (incomingMutation ? effects.focusedPagePatch : undefined);
     this.effects = {
       documentPaginationPending:
         this.effects.documentPaginationPending || effects.documentPaginationPending,
       flowChanged: this.effects.flowChanged || effects.flowChanged,
       paginationCompleted: this.effects.paginationCompleted || effects.paginationCompleted,
+      ...(focusedCursorGeometry ? { focusedCursorGeometry } : {}),
+      ...(focusedPagePatch ? { focusedPagePatch } : {}),
     };
   }
 
@@ -106,6 +160,24 @@ export class TextMutationEffectAccumulator {
   clear(): void {
     this.effects = NO_TEXT_MUTATION_EFFECTS;
   }
+}
+
+function mergeFocusedPagePatches(
+  first: DeferredFocusedPagePatch | undefined,
+  second: DeferredFocusedPagePatch | undefined,
+): DeferredFocusedPagePatch | undefined {
+  if (!first || !second || first.pageIndex !== second.pageIndex) return undefined;
+  const x = Math.min(first.x, second.x);
+  const y = Math.min(first.y, second.y);
+  const right = Math.max(first.x + first.width, second.x + second.width);
+  const bottom = Math.max(first.y + first.height, second.y + second.height);
+  return {
+    pageIndex: first.pageIndex,
+    x,
+    y,
+    width: right - x,
+    height: bottom - y,
+  };
 }
 
 // ─── 편집 작업 서술자 (라우팅 통합) ────────────────────
@@ -165,7 +237,14 @@ export type OperationDescriptor =
   | { kind: 'command'; command: EditCommand; meta?: OperationMetadata }
   // [Task #2370] snapshot 의 operation 은 아무것도 바꾸지 않았을 때 `null` 을 반환해
   // "기록하지 말 것"을 알린다(그 경우 커서 이동·리프레시도 건너뛴다).
-  | { kind: 'snapshot'; operationType: string; operation: (wasm: WasmBridge) => DocumentPosition | null; meta?: OperationMetadata }
+  | {
+      kind: 'snapshot';
+      operationType: string;
+      operation: (wasm: WasmBridge) => DocumentPosition | null;
+      /** 본문 좌표와 분리된 HF/FN 편집 문맥. undo/redo 뒤 같은 문맥으로 돌아간다. */
+      editContext?: EditContext;
+      meta?: OperationMetadata;
+    }
   | { kind: 'record'; command: EditCommand; meta?: OperationMetadata };
 
 // ─── 본문/셀 분기 헬퍼 ────────────────────────────────
@@ -298,6 +377,48 @@ function cellParagraphPosition(
   };
 }
 
+function focusedCellCursorGeometryFromResult(
+  pos: DocumentPosition,
+  result: DeferredCellTextMutationResult,
+): FocusedCellCursorGeometry | undefined {
+  const geometry = result.focusedCursorGeometry;
+  if (
+    !result.paginationDeferred
+    || result.cellFlowChanged
+    || !geometry
+    || geometry.targetCharOffset !== result.charOffset
+  ) {
+    return undefined;
+  }
+  const cloneAt = (charOffset: number): DocumentPosition => ({
+    ...pos,
+    charOffset,
+    cellPath: pos.cellPath?.map((entry) => ({ ...entry })),
+    cursorRect: undefined,
+  });
+  return {
+    baseRevision: geometry.baseRevision,
+    revision: geometry.revision,
+    source: cloneAt(geometry.sourceCharOffset),
+    target: cloneAt(geometry.targetCharOffset),
+    deltaX: geometry.deltaX,
+  };
+}
+
+function focusedPagePatchFromResult(
+  result: DeferredCellTextMutationResult,
+): DeferredFocusedPagePatch | undefined {
+  if (
+    !result.paginationDeferred
+    || result.cellFlowChanged
+    || !result.focusedPageTreePatched
+    || !result.focusedPagePatch
+  ) {
+    return undefined;
+  }
+  return { ...result.focusedPagePatch };
+}
+
 export function insertTextWithMutationEffects(
   wasm: WasmBridge,
   pos: DocumentPosition,
@@ -308,10 +429,14 @@ export function insertTextWithMutationEffects(
   } else if (isCell(pos)) {
     if (canUseDeferredCellTextInsert(pos, text)) {
       const result = wasm.insertTextInCellDeferredPagination(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, pos.cellIndex!, pos.cellParaIndex!, pos.charOffset, text);
+      const focusedCursorGeometry = focusedCellCursorGeometryFromResult(pos, result);
+      const focusedPagePatch = focusedPagePatchFromResult(result);
       return {
         documentPaginationPending: result.paginationDeferred,
         flowChanged: result.cellFlowChanged,
         paginationCompleted: !result.paginationDeferred,
+        ...(focusedCursorGeometry ? { focusedCursorGeometry } : {}),
+        ...(focusedPagePatch ? { focusedPagePatch } : {}),
       };
     } else {
       wasm.insertTextInCell(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, pos.cellIndex!, pos.cellParaIndex!, pos.charOffset, text);
@@ -360,10 +485,14 @@ export function replaceCellTextWithMutationEffects(
     deleteCount,
     text,
   );
+  const focusedCursorGeometry = focusedCellCursorGeometryFromResult(pos, result);
+  const focusedPagePatch = focusedPagePatchFromResult(result);
   return {
     documentPaginationPending: result.paginationDeferred,
     flowChanged: result.paginationDeferred && result.cellFlowChanged,
     paginationCompleted: !result.paginationDeferred,
+    ...(focusedCursorGeometry ? { focusedCursorGeometry } : {}),
+    ...(focusedPagePatch ? { focusedPagePatch } : {}),
   };
 }
 
@@ -388,10 +517,14 @@ export function deleteTextWithMutationEffects(
   } else if (isCell(pos)) {
     if (canUseDeferredCellTextDelete(pos, count)) {
       const result = wasm.deleteTextInCellDeferredPagination(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, pos.cellIndex!, pos.cellParaIndex!, pos.charOffset, count);
+      const focusedCursorGeometry = focusedCellCursorGeometryFromResult(pos, result);
+      const focusedPagePatch = focusedPagePatchFromResult(result);
       return {
         documentPaginationPending: result.paginationDeferred,
         flowChanged: result.cellFlowChanged,
         paginationCompleted: !result.paginationDeferred,
+        ...(focusedCursorGeometry ? { focusedCursorGeometry } : {}),
+        ...(focusedPagePatch ? { focusedPagePatch } : {}),
       };
     }
     wasm.deleteTextInCell(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, pos.cellIndex!, pos.cellParaIndex!, pos.charOffset, count);
@@ -423,6 +556,32 @@ function doGetTextRange(wasm: WasmBridge, pos: DocumentPosition, count: number):
   }
 }
 
+/**
+ * [#4162] 캐럿 대기 글자 모양(pending char shape) — 방금 삽입된 range 에 글자 서식을 건다.
+ *
+ * ApplyCharFormatCommand.execute() 의 셀/본문 분기와 같은 축이다(셀은 항상 ...ByPath).
+ * from === to(빈 range)면 적용 대상이 없으므로 아무것도 하지 않는다.
+ */
+export function applyCharShapeModsToRange(
+  wasm: WasmBridge,
+  pos: DocumentPosition,
+  from: number,
+  to: number,
+  props: Partial<CharProperties>,
+): void {
+  if (to <= from) return;
+  const propsJson = JSON.stringify(props);
+  if (isCell(pos)) {
+    wasm.applyCharFormatInCellByPath(pos.sectionIndex, pos.parentParaIndex!, cellPathJson(pos), from, to, propsJson);
+  } else {
+    wasm.applyCharFormat(pos.sectionIndex, pos.paragraphIndex, from, to, propsJson);
+  }
+}
+
+function sameCharFormat(a: Partial<CharProperties> | undefined, b: Partial<CharProperties> | undefined): boolean {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
+
 // ─── 텍스트 삽입 명령 ─────────────────────────────────
 
 export class InsertTextCommand implements EditCommand {
@@ -434,14 +593,24 @@ export class InsertTextCommand implements EditCommand {
     private position: DocumentPosition,
     private text: string,
     timestamp?: number,
+    /** [#4162] 선택 없이 지정한 예약 글자 모양 — 삽입된 텍스트에 그대로 건다. */
+    private charFormat?: Partial<CharProperties>,
   ) {
     this.timestamp = timestamp ?? Date.now();
+  }
+
+  getCharFormat(): Partial<CharProperties> | undefined {
+    return this.charFormat;
   }
 
   execute(wasm: WasmBridge): DocumentPosition {
     this.lastMutationEffects = NO_TEXT_MUTATION_EFFECTS;
     this.lastMutationEffects = insertTextWithMutationEffects(wasm, this.position, this.text);
-    return { ...this.position, charOffset: this.position.charOffset + this.text.length };
+    const after = { ...this.position, charOffset: this.position.charOffset + this.text.length };
+    if (this.charFormat) {
+      applyCharShapeModsToRange(wasm, this.position, this.position.charOffset, after.charOffset, this.charFormat);
+    }
+    return after;
   }
 
   consumeTextMutationEffects(): TextMutationEffects {
@@ -481,8 +650,10 @@ export class InsertTextCommand implements EditCommand {
     if (other.timestamp - this.timestamp > 300) return null;
     // 줄바꿈/탭 포함 시 병합 불가
     if (other.text.includes('\n') || other.text.includes('\t')) return null;
+    // [#4162] 예약 글자 모양이 다르면 하나의 undo 단위로 묶지 않는다
+    if (!sameCharFormat(this.charFormat, other.charFormat)) return null;
 
-    return new InsertTextCommand(this.position, this.text + other.text, this.timestamp);
+    return new InsertTextCommand(this.position, this.text + other.text, this.timestamp, this.charFormat);
   }
 }
 
@@ -692,8 +863,14 @@ export class DeleteSelectionCommand implements EditCommand {
    * 양식 모드 선택 삭제가 게이트에서 드롭돼 무언 폐기가 된다.
    */
   private readonly snapshot: SnapshotCommand;
+  private readonly selection: {
+    start: DocumentPosition;
+    end: DocumentPosition;
+    blockPhase: number | null;
+  };
 
-  constructor(start: DocumentPosition, end: DocumentPosition) {
+  constructor(start: DocumentPosition, end: DocumentPosition, blockPhase: number | null = null) {
+    this.selection = { start: { ...start }, end: { ...end }, blockPhase };
     // 삭제 후 커서는 선택 시작으로 모이고, undo 후에는 선택 끝으로 되돌아간다.
     this.snapshot = new SnapshotCommand('deleteSelection', end, start, (wasm) => {
       if (isCell(start)) {
@@ -723,6 +900,16 @@ export class DeleteSelectionCommand implements EditCommand {
   }
 
   mergeWith(): null { return null; }
+
+  /**
+   * [Task #3416] 지우기 전 선택 범위. undo 뒤 이 범위를 되살린다.
+   *
+   * undo 가 돌려주는 커서가 이미 `end`(선택 끝)라, 여기에 anchor(`start`)만 더하면 한컴과
+   * 같은 상태가 된다 — 실측에서 undo 후 선택은 `(0,0,18)~(0,0,22)`, 캐럿은 `(0,0,22)` 였다.
+   */
+  selectionBefore(): { start: DocumentPosition; end: DocumentPosition; blockPhase: number | null } {
+    return this.selection;
+  }
 
   snapshotResourceCount(): number {
     return this.snapshot.snapshotResourceCount();
@@ -1344,10 +1531,12 @@ export class MergeParagraphInFootnoteCommand implements EditCommand {
 export class SplitParagraphInCellCommand implements EditCommand {
   readonly type = 'splitParagraphInCell';
   readonly timestamp = Date.now();
+  private lastMutationEffects: TextMutationEffects = NO_TEXT_MUTATION_EFFECTS;
 
   constructor(private position: DocumentPosition) {}
 
   execute(wasm: WasmBridge): DocumentPosition {
+    this.lastMutationEffects = NO_TEXT_MUTATION_EFFECTS;
     const pos = this.position;
     const sec = pos.sectionIndex;
     const ppi = pos.parentParaIndex!;
@@ -1357,7 +1546,16 @@ export class SplitParagraphInCellCommand implements EditCommand {
     } else {
       wasm.splitParagraphInCell(sec, ppi, pos.controlIndex!, pos.cellIndex!, cpi, pos.charOffset);
     }
+    // [#4031] 네이티브 split은 paginate_if_needed()로 최신 revision을 동기 계산한다.
+    // 이 선언이 pending deferred 상태를 해소해 직후 before-full-edit flush가 no-op이 된다.
+    this.lastMutationEffects = IMMEDIATE_TEXT_MUTATION_EFFECTS;
     return cellParagraphPosition(pos, cpi + 1, 0);
+  }
+
+  consumeTextMutationEffects(): TextMutationEffects {
+    const effects = this.lastMutationEffects;
+    this.lastMutationEffects = NO_TEXT_MUTATION_EFFECTS;
+    return effects;
   }
 
   undo(wasm: WasmBridge): DocumentPosition {
@@ -1776,6 +1974,74 @@ export class MoveLineEndpointCommand implements EditCommand {
 }
 
 /**
+ * [Task #3230] 개체 속성 변경의 역연산 명령 (kind:'record' 용, #2337 계열).
+ *
+ * 스냅샷 대신 쓰는 이유는 비용이다. 스냅샷 1개는 `Document` 통째 클론이라 문서에 비례하고
+ * (실측: 30KB 공문 0.43 MB · 10MB 행정편람 10.59 MB), `SnapshotCommand` 는 before/after 로
+ * 2개를 쓴다. 회전 한 번에 최대 21 MB 를 스택에 얹는 셈인데, 실제로 되돌려야 하는 것은
+ * **스칼라 속성 하나**다.
+ *
+ * 역연산이 자명한 조건은 셋이고 회전·대칭은 셋을 다 만족한다.
+ *  - setter 가 **절대값**이다(누적·토글이 아니라 `rotationAngle = 30`, `horzFlip = true`).
+ *  - 호출부가 적용 **전에 현재 값을 이미 읽는다**(다음 각도·토글 반대값을 그것으로 만든다).
+ *  - 그 속성만 바뀐다 — 파생 상태(레이아웃·앵커)는 setter 가 다시 계산한다.
+ *
+ * 뮤테이션은 호출부가 적용하고 이 명령은 기록만 담당한다(`execute` 는 redo 경로에서만 재적용).
+ */
+export class SetObjectPropsCommand implements EditCommand {
+  readonly type = 'setObjectProps';
+  readonly timestamp: number;
+
+  constructor(
+    private ref: ObjectPropsRef,
+    private before: Record<string, unknown>,
+    private after: Record<string, unknown>,
+    timestamp?: number,
+  ) {
+    this.timestamp = timestamp ?? Date.now();
+  }
+
+  private apply(wasm: WasmBridge, props: Record<string, unknown>): DocumentPosition {
+    setObjectProps(wasm, this.ref, props);
+    return { sectionIndex: this.ref.sec, paragraphIndex: this.ref.ppi, charOffset: 0 };
+  }
+
+  execute(wasm: WasmBridge): DocumentPosition {
+    return this.apply(wasm, this.after);
+  }
+
+  undo(wasm: WasmBridge): DocumentPosition {
+    return this.apply(wasm, this.before);
+  }
+
+  /**
+   * 적용해도 달라질 것이 없으면 무변경이다 (#2370 규약).
+   *
+   * 히스토리는 커맨드에게 이 질문을 하고(`history.ts` 의 `command.isNoOp?.()`), 답하지 않으면
+   * "항상 바꾼다" 로 읽는다. before 와 after 가 같은데 침묵하면 그 자체가 거짓 응답이고,
+   * 팬텀 엔트리가 Ctrl+Z 한 번을 무효과로 소모하며 redo 스택까지 파기한다.
+   *
+   * 지금 호출부(±90° 회전·`!cur` 토글)는 항상 before ≠ after 라 이 분기를 타지 않는다. 그래도
+   * 답은 커맨드가 해야 한다 — before/after 를 아는 것은 이 객체뿐이고, 호출부마다 같은 비교를
+   * 되풀이하는 것은 판정을 소비자로 흘리는 일이다.
+   *
+   * `after` 의 키만 본다. `execute` 가 적용하는 것이 그것뿐이므로 `before` 에만 있는 키는
+   * 이 연산의 결과를 바꾸지 않는다.
+   */
+  isNoOp(): boolean {
+    const keys = Object.keys(this.after);
+    if (keys.length === 0) return true;
+    return keys.every((key) => Object.is(this.before[key], this.after[key]));
+  }
+
+  /**
+   * 병합하지 않는다. 회전 15° 를 네 번 누른 것과 60° 를 한 번 누른 것은 한컴에서도 undo
+   * 횟수가 다르다 — 묶으면 되돌리기 단위가 사용자가 누른 단위와 어긋난다.
+   */
+  mergeWith(): null { return null; }
+}
+
+/**
  * [Task #2374] 양식 값 변경 대상 — 본문 또는 표 셀 내 컨트롤 locator + 전/후 값 JSON.
  * before/after 는 setFormValue(InCell) 에 그대로 전달되는 JSON 문자열이다.
  */
@@ -1890,9 +2156,23 @@ export class SnapshotCommand implements EditCommand {
         this.cursorAfter = result;
       }
       this.afterId = wasm.saveSnapshot();
-    } catch (e) {
-      this.discard(wasm); // before/after id 를 null-safe 로 해제
-      throw e;
+    } catch (operationError) {
+      // [#3350] 최초 execute 가 실패하면 명령 전체를 원자적으로 되돌린다. 이 커맨드는
+      // history 에 push 되기 전이므로 before 스냅샷을 가진 SnapshotCommand만 rollback을
+      // 수행할 수 있다. after-save 실패도 execute 실패이므로 같은 계약을 따른다.
+      try {
+        if (this.beforeId !== null) {
+          wasm.restoreSnapshot(this.beforeId);
+        }
+      } catch (rollbackError) {
+        this.discard(wasm);
+        throw new AggregateError(
+          [operationError, rollbackError],
+          `${this.type} 실행 실패 후 rollback도 실패했습니다`,
+        );
+      }
+      this.discard(wasm);
+      throw operationError;
     }
 
     // operation 참조 해제 (클로저에 캡처된 리소스 해제)
@@ -1930,4 +2210,25 @@ export class SnapshotCommand implements EditCommand {
       this.afterId = null;
     }
   }
+}
+
+/**
+ * 머리말/꼬리말·각주 안에서만 쓰는 스냅샷 명령.
+ *
+ * 일반 SnapshotCommand는 구조 편집처럼 undo 뒤 본문으로 돌아가야 하는 작업도 담당한다.
+ * 그래서 편집 문맥을 일반 클래스에 붙이지 않고, 서브모드를 보존해야 하는 호출부만 이 타입을
+ * 명시적으로 선택한다.
+ */
+export class SubmodeSnapshotCommand extends SnapshotCommand {
+  constructor(
+    operationType: string,
+    cursorBefore: DocumentPosition,
+    cursorAfter: DocumentPosition,
+    operation: ((wasm: WasmBridge) => DocumentPosition | null) | null,
+    private readonly context: EditContext,
+  ) {
+    super(operationType, cursorBefore, cursorAfter, operation);
+  }
+
+  editContext(): EditContext { return this.context; }
 }

@@ -2,7 +2,7 @@
 kind: guide
 status: active
 canonical: mydocs/manual/pr_review_workflow.md
-last_verified: 2026-07-25
+last_verified: 2026-08-16
 ---
 
 # Merge 후속 처리
@@ -23,6 +23,11 @@ last_verified: 2026-07-25
 
 시각 asset URL을 comment에 쓰면 asset이 devel에 실제 존재한 뒤에만 게시한다. 이미 완료된 원 PR의 기록만
 담는 별도 fast-pass PR은 5–6과 오늘할일 갱신을 반복하지 않고, devel sync와 cleanup만 수행한다.
+
+작업지시자가 PR 병합과 `merge 후 후속 처리`를 함께 승인한 경우, 7번은 선택 보고가 아니라 완료 전 실행
+게이트다. 해당 PR만을 위해 만든 clean한 local branch와 local worktree의 제거는 별도 승인 없이 이 단계에서
+수행한다. 원격 branch 삭제나 기본 작업공간·공유 산출물·사용자 또는 다른 도구 소유 대상의 삭제는 포함하지
+않는다.
 
 ## 7.5 renderer golden 선행조건
 
@@ -120,9 +125,12 @@ done
 
 OPEN이면 작업지시자 승인 뒤 수동 close와 후속 comment를 남긴다.
 
+여러 단락의 후속 기록은 [공통 본문 전송 규칙](../pr_review_workflow.md#34-github-markdown-본문-전송)에 따라
+close와 comment를 분리하고 실제 줄바꿈을 담은 `--body-file`을 쓴다.
+
 ~~~bash
-gh issue close N --repo edwardkim/rhwp \
-  --comment "[PR M](https://github.com/edwardkim/rhwp/pull/M) 머지로 해결 (by @contributor). ..."
+gh issue close N --repo edwardkim/rhwp
+gh issue comment N --repo edwardkim/rhwp --body-file <issue-comment.md>
 ~~~
 
 CLOSED여도 같은 merge commit·같은 검증 증적의 maintainer comment가 아직 없으면 다음을 담은 comment를 남긴다.
@@ -136,21 +144,46 @@ CLOSED여도 같은 merge commit·같은 검증 증적의 maintainer comment가 
 GitHub bot auto-close comment만으로 후속 기록이 완료된 것은 아니다. 같은 commit·같은 증적의 maintainer
 comment가 있으면 중복 게시하지 않고 permalink를 상태 보고에 남긴다.
 
+### 7.3.1 sub-issue 연동 부모 issue의 close
+
+추적 성격의 부모 issue(discussion 발견 여러 건을 부모로 묶고 실작업을 sub-issue로 분리한 경우 등)는
+마지막 sub-issue close 시점에 함께 close하는 것을 기본으로 한다. 단 다음을 모두 지킨다.
+
+- 부모 귀속 산출물(가드 테스트 PR 등)이 모두 merge된 뒤에만 close한다. sub-issue close를 단일
+  트리거로 삼지 않는다.
+- sub-issue 연동은 close 시점 규칙일 뿐 절차 단축이 아니다. devel 반영 검증(`git branch --contains`)과
+  작업지시자 승인 게이트는 동일하게 거친다. GitHub는 sub-issue 완료 시 부모를 자동 close하지 않으므로
+  항상 수동 close다.
+- close comment에 판정 경위를 명시한다. "버그 수정으로 닫힘"이 아닌 경우(오등록 판정, 이미 닫힌 축
+  귀속, 가드 보강)는 그 성격과 귀속 커밋을 남겨 사후 검색이 성격을 오독하지 않게 한다.
+
+첫 적용 사례: #3552(부모 — 재현 불가 판정, 가드 테스트 PR 귀속) / #3576(sub-issue — 실작업).
+close 체크리스트: ① sub-issue close ② 가드 테스트 PR merge ③ 판정 경위 close comment
+④ 작업지시자 승인.
+
 ## 7.4 contributor PR comment
 
 원 PR에는 감사, merge 사실, 실제 검증 결과, 필요하면 후속 issue를 남긴다. issue·PR·comment는 평문 번호
 대신 Markdown direct link로 쓴다.
 
-시각 검증을 merge 판단 근거로 썼다면 실제 devel asset을 보이게 포함한다.
+시각 검증을 merge 판단 근거로 썼다면 [Visual Sweep의 GitHub merge comment 정본](../verification/visual_sweep_guide.md#github-merge-comment)을
+direct link로 남기고, merge commit에 포함된 실제 asset을 보이게 포함한다. raw URL은 이미지 표시용 증적이며,
+문서 비교 방법의 정본은 Visual Sweep 가이드다.
 
 ~~~markdown
 검토 및 머지 완료했습니다. 감사합니다.
 
 - CI: Build & Test, CodeQL, Render Diff의 최신 head 결과 확인
 - 로컬 검증: 실제 실행한 focused/release-test/Native Skia 등
+- 문서 비교: [PDF/SVG visual sweep 가이드](https://github.com/edwardkim/rhwp/blob/devel/mydocs/manual/verification/visual_sweep_guide.md#github-merge-comment)를 따름
 - visual sweep: pN, flagged=0/N, pixel match NN.NNNNN%
 
-![PR N pN visual review](https://raw.githubusercontent.com/edwardkim/rhwp/devel/mydocs/pr/assets/<review>.png)
+코멘트: 내용 픽셀 중심 자동 일치율 보조값 = 약 NN.NN%.
+높을수록 좋음: 기준 PDF와 rhwp PNG가 더 비슷함
+낮을수록 나쁨/검토 필요: 잉크 위치나 형태 차이가 큼
+단, 사람 판정 정확도가 아니라 내용 픽셀 중심 자동 일치율 보조값입니다
+
+![PR N pN visual review](https://raw.githubusercontent.com/edwardkim/rhwp/<merge-commit-sha>/mydocs/pr/assets/<review>.png)
 ~~~
 
 이미지 link만 쓰거나 output 임시 경로만 남기지 않는다. review 문서에 기록된 실제 수치·페이지·결론만
@@ -165,6 +198,17 @@ heavy worker skip, final aggregate, issue 상태를 PR comment에 남긴다. 반
 성공 merge뿐 아니라 reject/close, supersede, review 중단, 후속 기록 fast-pass 완료도 최종 종료 gate다.
 정리 또는 유지 사유를 확인하기 전에는 후속 처리 완료라고 보고하지 않는다.
 
+이번 PR 또는 검토만을 위해 만든 별도 local worktree는 merge와 필수 후속 처리가 끝난 뒤 **제거가 기본**이다.
+여기에는 commit·push를 만들지 않고 PR diff 열람, CI 로그 조사, 재현, 검증, cherry-pick 누적 또는 merge
+simulation만 수행한 local 검토 worktree도 포함한다. 다음 작업의 편의를 위한 보존은 유지 사유가 아니다. 제거
+전에는 clean 상태와 사용자·다른 도구의 소유 여부를 확인하며, 활성 작업 또는 작업지시자의 명시 보존 지시 때문에
+제거하지 못하면 정확한 경로와 사유를 최종 상태에 기록한다. 기본 작업공간, 공유 `target/pr-review`, 사용자·다른
+도구가 만든 worktree는 이 규칙의 삭제 대상이 아니다.
+
+대상 worktree는 자기 자신을 제거할 수 없으므로, 정리 명령은 반드시 보존할 기본 작업공간 또는 다른 clean
+worktree에서 실행한다. merge가 성공한 것만 확인하고 대상 worktree에 그대로 남아 "후속 처리 완료"로
+보고해서는 안 된다.
+
 먼저 정확한 대상 이름과 worktree를 확인한다.
 
 ~~~bash
@@ -173,9 +217,9 @@ git branch --show-current
 git worktree list --porcelain
 ~~~
 
-PR fetch branch, merge simulation branch, review branch, docs-only/follow-up branch, 해당 worktree, collaborator가
-원본 저장소에 만든 head branch가 대상이다. 사용자·다른 도구가 만든 branch·worktree·remote branch는
-이름이 비슷해도 삭제 대상으로 가정하지 않는다.
+PR fetch branch, merge simulation branch, review branch, docs-only/follow-up branch, 그리고 코드 변경 없이
+검토만 수행한 local worktree가 대상이다. collaborator가 원본 저장소에 만든 head branch도 정리 후보가 될 수
+있다. 사용자·다른 도구가 만든 branch·worktree·remote branch는 이름이 비슷해도 삭제 대상으로 가정하지 않는다.
 
 worktree를 먼저 제거하고 그 뒤 local branch를 삭제한다. squash merge로 graph상 not fully merged여도
 PR MERGED, merge commit의 upstream/devel 포함, worktree clean, 문서·asset의 devel 존재를 모두 확인한
@@ -213,20 +257,25 @@ git ls-remote --heads upstream <headRefName>
 git status --short --branch
 ~~~
 
+최종 보고에는 이번 작업에서 사용한 각 local worktree를 `제거 완료` 또는 `유지`로 구분해 경로와 사유를
+기록한다. 이 확인 없이 PR 병합만으로 후속 처리가 완료된 것으로 보고하지 않는다.
+
 contributor fork의 head는 위 `upstream` 조회 대상이 아니다. PR metadata의 `headRepository`와
 `headRefName`을 기록하고, fork branch 삭제를 시도하지 않은 사실을 최종 상태에 남긴다.
 
 ### 7.7.1 검토 전용 target
 
-CARGO_TARGET_DIR=target/<review-name>처럼 이번 review만을 위해 만든 exact target 하위 directory는
-branch·worktree 정리 뒤에만 정리한다. shared target/debug, target/release, target/release-test,
-target/wasm32-unknown-unknown와 사용자·다른 도구 산출물은 삭제 대상으로 가정하지 않는다.
+PR review Cargo 검증의 고정 경로 `target/pr-review`는 branch·worktree 정리 뒤에도 보존한다. 이 경로는
+다음 review의 일반 컴파일 산출물을 재사용하는 shared review cache이며, 빌드 뒤 이동하면 통합 테스트에
+박힌 절대 실행 경로가 깨질 수 있다. shared target/debug, target/release, target/release-test,
+target/wasm32-unknown-unknown와 사용자·다른 도구 산출물도 삭제 대상으로 가정하지 않는다.
 
 ~~~bash
 find target -mindepth 1 -maxdepth 1 -type d -exec du -sh {} \;
 pgrep -alf '(^|/)(cargo|rustc|wasm-pack)( |$)' || true
 ~~~
 
-실행 중인 Cargo/Rust가 그 directory를 쓰면 유지한다. 현재 review 전용임을 확인한 정확한 하위 경로만
-제거하거나 복구 가능한 환경에서는 휴지통으로 이동한다. 이후 남은 target 하위 경로를 확인하고, 정리한
-정확한 이름과 보존한 shared 경로를 최종 상태에 기록한다.
+실행 중인 Cargo/Rust가 있으면 해당 target을 유지한다. `target/pr-review`는 정리하지 않고, 종료된 과거
+`target/review-*`처럼 고정 cache와 구별되는 exact legacy review directory만 소유·미사용을 확인한 뒤
+제거하거나 복구 가능한 환경에서는 휴지통으로 이동한다. 이후 남은 target 하위 경로와 보존한
+`target/pr-review`를 최종 상태에 기록한다.

@@ -20,7 +20,7 @@
 /** 문서 IR(직렬화 결과)을 바꾸는 WasmBridge 공개 메서드 전수. */
 export const MUTATING_METHODS: readonly string[] = [
   // 쪽/구역/다단
-  'setPageDef', 'setSectionDef', 'setSectionDefAll', 'setPageBorderFill', 'setColumnDef',
+  'setPageDef', 'setPageMargin', 'setSectionDef', 'setSectionDefAll', 'setPageBorderFill', 'setColumnDef',
   // 본문 텍스트/문단
   'insertText', 'replaceBodyTextLocal', 'deleteText', 'deleteRange', 'splitParagraph', 'mergeParagraph',
   'insertPageBreak', 'insertColumnBreak', 'insertNewNumber', 'setNumberingRestart',
@@ -31,7 +31,7 @@ export const MUTATING_METHODS: readonly string[] = [
   'splitParagraphInCell', 'mergeParagraphInCell', 'splitParagraphInCellByPath',
   'mergeParagraphInCellByPath',
   // 표 구조/속성
-  'createTable', 'createTableEx', 'deleteTableControl', 'insertTableRow',
+  'createTable', 'createTableEx', 'deleteTableControl', 'insertTableRow', 'splitTable', 'mergeTableWithNext',
   'insertTableColumn', 'deleteTableRow', 'deleteTableColumn', 'mergeTableCells',
   'splitTableCell', 'splitTableCellInto', 'splitTableCellsInRange', 'resizeTableCells',
   'moveTableOffset', 'setTableProperties', 'setCellProperties', 'setCellZoneProperties',
@@ -44,6 +44,8 @@ export const MUTATING_METHODS: readonly string[] = [
   'createShapeControl', 'setShapeProperties', 'deleteShapeControl', 'changeShapeZOrder',
   'groupShapes', 'ungroupShape', 'moveLineEndpoint', 'updateConnectorsInSection',
   'insertEquation', 'setEquationProperties', 'setNoteEquationProperties', 'deleteEquationControl',
+  // 차트 데이터 (#4694) — bin_data_content 슬롯 바이트 변이 (IR 무변경이지만 직렬화 결과가 바뀐다)
+  'setChartData', 'setChartDataByIndex',
   // 각주/미주
   'insertFootnote', 'insertEndnote', 'deleteFootnote', 'applyEndnoteShape',
   'insertTextInFootnote', 'deleteTextInFootnote', 'splitParagraphInFootnote',

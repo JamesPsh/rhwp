@@ -2,7 +2,7 @@
 kind: guide
 status: active
 canonical: mydocs/README.md
-last_verified: 2026-07-23
+last_verified: 2026-08-15
 ---
 
 # rhwp 문서 지도와 canonical manifest
@@ -34,7 +34,7 @@ front matter는 `mydocs/manual`, `mydocs/tech`, `mydocs/troubleshootings`의 모
 감사한 뒤 현재 탐색 비용을 실제로 줄이는 다음 경계만 채택했다.
 
 - `manual/verification/`: 시각 검증 정책과 실행 가이드
-- `manual/codex/`: 저장소 부트스트랩과 현행 문서·Git 절차
+- `manual/codex/`: 저장소 부트스트랩, 활성 프로젝트 메모리와 현행 문서·Git 절차
 - `manual/pr_review/`: canonical PR review 라우터가 조건별로 선택하는 역할·검증·후속 처리 가이드
 - `manual/memory/`: 과거 피드백과 memory 출처
 - `tech/investigations/issue-####/`: 특정 이슈의 가설·실험·관찰
@@ -50,13 +50,16 @@ front matter는 `mydocs/manual`, `mydocs/tech`, `mydocs/troubleshootings`의 모
 
 | 경로 | kind | status | canonical | last_verified |
 | --- | --- | --- | --- | --- |
-| [문서·Git 워크플로](manual/codex/docs_and_git_workflow.md) | canonical | active | `manual/codex/docs_and_git_workflow.md` | 2026-07-16 |
+| [프로젝트 로드맵](../ROADMAP.md) | canonical | active | `ROADMAP.md` | 2026-08-10 |
+| [문서·Git 워크플로](manual/codex/docs_and_git_workflow.md) | canonical | active | `manual/codex/docs_and_git_workflow.md` | 2026-08-07 |
+| [GitHub 저장소 운영 매뉴얼](manual/github_operations.md) | canonical | active | `manual/github_operations.md` | 2026-08-15 |
 | [Codex 문서 지도](manual/codex/README.md) | guide | active | `manual/codex/README.md` | 2026-07-17 |
+| [Codex 프로젝트 메모리 덤프](manual/codex/MEMORY.md) | memory | active | `manual/codex/MEMORY.md` | 2026-08-07 |
 | [Claude memory dump 색인](manual/memory/MEMORY.md) | memory | historical | `manual/codex/docs_and_git_workflow.md` | 2026-07-17 |
-| [PR 리뷰·통합 워크플로](manual/pr_review_workflow.md) | canonical | active | `manual/pr_review_workflow.md` | 2026-07-25 |
+| [PR 리뷰·통합 워크플로](manual/pr_review_workflow.md) | canonical | active | `manual/pr_review_workflow.md` | 2026-08-07 |
 | [PR review 조건별 가이드](manual/pr_review/README.md) | guide | active | `manual/pr_review_workflow.md` | 2026-07-25 |
 | [에이전트 capability 카탈로그](manual/agent_capability_registry.md) | canonical | active | `manual/agent_capability_registry.md` | 2026-07-26 |
-| [개발 환경 가이드](manual/dev_environment_guide.md) | guide | active | `manual/dev_environment_guide.md` | 2026-07-17 |
+| [개발 환경 가이드](manual/dev_environment_guide.md) | guide | active | `manual/dev_environment_guide.md` | 2026-08-11 |
 | [온보딩 가이드](manual/onboarding_guide.md) | guide | active | `manual/README.md` | 2026-07-17 |
 | [배포 가이드](manual/publish_guide.md) | guide | active | `manual/publish_guide.md` | 2026-07-17 |
 | [Hyper-Waterfall 문서 체계](manual/hyper_waterfall_docs_guide.md) | guide | active | `manual/codex/docs_and_git_workflow.md` | 2026-07-17 |
@@ -70,6 +73,7 @@ front matter는 `mydocs/manual`, `mydocs/tech`, `mydocs/troubleshootings`의 모
 | [한글 문서 파일 형식 5.0 개정 1.3](tech/한글문서파일형식_5.0_revision1.3.md) | reference | active | `tech/hwp_spec_errata.md` | 2026-07-16 |
 | [Document IR LineSeg 표준](tech/document_ir_lineseg_standard.md) | canonical | active | `tech/document_ir_lineseg_standard.md` | 2026-07-16 |
 | [렌더링 엔진 설계](tech/rendering_engine_design.md) | canonical | active | `tech/rendering_engine_design.md` | 2026-07-23 |
+| [수식 모듈 매뉴얼](manual/equation_module.md) | guide | active | `manual/equation_module.md` | 2026-08-18 |
 | [표 레이아웃 규칙](tech/table_layout_rules.md) | canonical | active | `tech/table_layout_rules.md` | 2026-07-16 |
 | [폰트 fallback 전략](tech/font_fallback_strategy.md) | canonical | active | `tech/font_fallback_strategy.md` | 2026-07-16 |
 | [편집 action undo/redo 아키텍처](tech/edit_action_undo_redo_architecture.md) | canonical | active | `tech/edit_action_undo_redo_architecture.md` | 2026-07-16 |

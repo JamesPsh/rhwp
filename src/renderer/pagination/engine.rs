@@ -48,12 +48,10 @@ fn should_hide_page_bottom_empty_reset_bridge(
     curr_vpos_near_bottom && next_starts_new_page
 }
 
-fn is_sample16_integrated_db_cluster_tail_paragraph(para: &Paragraph) -> bool {
-    para.text.starts_with('\u{F03C5}')
-        && para
-            .text
-            .contains("계약상대자는 통합DB서버에서 운영될 주요업무에 대해 Active-Active")
-        && para.controls.iter().all(|c| matches!(c, Control::Field(_)))
+fn controls_are_inline_text_metadata(para: &Paragraph) -> bool {
+    para.controls
+        .iter()
+        .all(|control| matches!(control, Control::Field(_) | Control::Hyperlink(_)))
 }
 
 fn internal_vpos_page_break_line(
@@ -62,9 +60,10 @@ fn internal_vpos_page_break_line(
     body_height_px: f64,
     dpi: f64,
 ) -> Option<usize> {
-    if !is_sample16_integrated_db_cluster_tail_paragraph(para)
-        || line_count < 2
+    if line_count < 2
         || para.line_segs.len() < line_count
+        || !para_has_visible_text(para)
+        || !controls_are_inline_text_metadata(para)
     {
         return None;
     }
@@ -94,7 +93,7 @@ fn internal_vpos_page_break_line(
         })
 }
 
-fn sample16_missing_lineseg_tail_break_line(
+fn missing_lineseg_trailing_line_break(
     para: &Paragraph,
     line_count: usize,
     current_height: f64,
@@ -103,12 +102,13 @@ fn sample16_missing_lineseg_tail_break_line(
     if !para.line_segs.is_empty()
         || line_count < 4
         || current_height < available * 0.75
-        || !is_sample16_integrated_db_cluster_tail_paragraph(para)
+        || !para_has_visible_text(para)
+        || !controls_are_inline_text_metadata(para)
     {
         return None;
     }
 
-    Some(3)
+    Some(line_count - 1)
 }
 
 fn is_synthetic_line_seg(ls: &LineSeg) -> bool {
@@ -764,6 +764,8 @@ impl Paginator {
                             para_index: para_idx,
                             table_para_index: wrap_around_table_para,
                             has_text: !is_empty_para,
+                            start_line: 0,
+                            end_line: usize::MAX,
                         });
                     continue;
                 } else {
@@ -917,7 +919,8 @@ impl Paginator {
                                         crate::renderer::hwpunit_to_px(seg.line_height, self.dpi);
                                     let mt_h =
                                         measured.get_table_height(para_idx, ci).unwrap_or(0.0);
-                                    let effective_h = seg_lh.max(mt_h);
+                                    let effective_h =
+                                        crate::renderer::tac_table_effective_height(seg_lh, mt_h);
                                     let ls = if seg.line_spacing > 0 {
                                         crate::renderer::hwpunit_to_px(seg.line_spacing, self.dpi)
                                     } else {
@@ -1221,7 +1224,7 @@ impl Paginator {
                     breaks.push(line);
                 }
             }
-            if let Some(line) = sample16_missing_lineseg_tail_break_line(
+            if let Some(line) = missing_lineseg_trailing_line_break(
                 para,
                 line_count_for_break,
                 st.current_height,
@@ -1739,10 +1742,10 @@ impl Paginator {
                     );
                 }
                 Control::Shape(shape_obj) => {
-                    // [Issue #476] treat_as_char Shape 는 박스가 속한 line 이 라우팅된 페이지/단에 등록.
+                    // [Issue #476/#4092] treat_as_char 그림/도형은 박스가 속한 line 이 라우팅된 페이지/단에 등록.
                     // paragraph 가 페이지 분할되면 process_controls 시점에 st.current_items 는 마지막
                     // 페이지 상태이므로, 그대로 push 하면 박스가 잘못된 페이지에 떠 있게 된다.
-                    let routed = if shape_obj.common().treat_as_char {
+                    let routed = if super::is_routable_treat_as_char_picture_or_shape(ctrl) {
                         super::find_inline_control_target_page(
                             &st.pages,
                             &st.current_items,
@@ -1788,6 +1791,7 @@ impl Paginator {
                                                 tb_para_index: tp_idx,
                                                 tb_control_index: tc_idx,
                                             },
+                                            fragment: None,
                                         });
                                         let fn_height = super::estimate_footnote_note_height(
                                             &fn_ctrl, self.dpi,
@@ -1837,6 +1841,7 @@ impl Paginator {
                                 para_index: para_idx,
                                 control_index: ctrl_idx,
                             },
+                            fragment: None,
                         });
                         let fn_height = super::estimate_footnote_note_height(fn_ctrl, self.dpi);
                         st.add_footnote_height(fn_height);
@@ -2180,6 +2185,7 @@ impl Paginator {
                                     cell_para_index: cp_idx,
                                     cell_control_index: cc_idx,
                                 },
+                                fragment: None,
                             });
                             let fn_height = super::estimate_footnote_note_height(fn_ctrl, self.dpi);
                             st.add_footnote_height(fn_height);
@@ -2370,6 +2376,13 @@ impl Paginator {
         spacing_before_px: f64,
         _is_tac_table: bool,
     ) {
+        // [Issue #4326] `mt`(MeasuredTable)는 `HeightMeasurer::measure_table_impl`이
+        // 투명 1×1 래퍼를 벗긴 표를 기준으로 만들어질 수 있다 — `row_count`/`row_heights`가
+        // `table`(바깥 컨트롤 표) 자신의 행 수와 다를 수 있다는 뜻이다. 이 함수가 아래에서
+        // 방출하는 모든 PartialTable의 start_row/end_row는 그 `mt` 기준이므로, 같은 unwrap
+        // 규칙(`row_geometry_table`)으로 좌표계를 판정해 PageItem에 데이터로 싣는다.
+        let row_cursor_is_nested =
+            !std::ptr::eq(crate::renderer::typeset::row_geometry_table(table), table);
         let row_count = mt.row_heights.len();
         let cs = mt.cell_spacing;
         let header_row_height = if row_count > 0 {
@@ -2732,6 +2745,9 @@ impl Paginator {
                         start_cut: Vec::new(),
                         end_cut: Vec::new(),
                         is_block_split: false,
+                        row_cursor_is_nested,
+                        end_row_height_override: None,
+                        start_row_height_override: None,
                     });
                     // 마지막 부분 표: spacing_after도 포함 (레이아웃과 일치)
                     let mp = measured.get_measured_paragraph(para_idx);
@@ -2751,6 +2767,9 @@ impl Paginator {
                 start_cut: Vec::new(),
                 end_cut: Vec::new(),
                 is_block_split: false,
+                row_cursor_is_nested,
+                end_row_height_override: None,
+                start_row_height_override: None,
             });
             st.advance_column_or_new_page();
 

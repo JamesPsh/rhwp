@@ -13,6 +13,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 
 use super::layer_renderer::{LayerRenderResult, LayerRenderer};
+use super::partial_replay::{expanded_plain_text_replay_bounds, expanded_text_replay_bounds};
 use super::pua_oldhangul::map_pua_old_hangul;
 use super::render_tree::{
     BoundingBox, EllipseNode, EquationNode, FootnoteMarkerNode, FormObjectNode, ImageNode,
@@ -23,8 +24,8 @@ use super::render_tree::{
     REAL_PICTURE_WATERMARK_PAGE_OPACITY, REAL_PICTURE_WATERMARK_SATURATION,
 };
 use super::{
-    clamp_tab_leader_end_x, GradientFillInfo, LineStyle, PathCommand, PatternFillInfo, Renderer,
-    ShapeStyle, StrokeDash, TextStyle,
+    boxed_pua_char_overlap_semantics, clamp_tab_leader_end_x, GradientFillInfo, LineStyle,
+    PathCommand, PatternFillInfo, Renderer, ShapeStyle, StrokeDash, TextStyle,
 };
 use crate::model::style::ImageFillMode;
 use crate::model::style::UnderlineType;
@@ -36,26 +37,23 @@ use crate::paint::{
 
 const TEXT_MARK_CLIP_RIGHT_PAD: f64 = 48.0;
 
-/// Canvas 폰트의 실측 폭을 레이아웃 advance에 맞출 때 적용할 배율을 계산한다.
-///
-/// 음수 자간은 다음 글자의 시작 위치만 당기는 속성이다. 이를 글자 자체의 폭 제한으로
-/// 사용하면 한글 glyph가 가로로 눌리므로, 음수 자간에서는 폭 맞춤을 적용하지 않는다.
-fn canvas_cluster_fit_scale(
-    cluster_advance: f64,
-    visual_width: f64,
-    letter_spacing: f64,
-    pin_ascii_advance: bool,
-) -> Option<f64> {
-    if cluster_advance <= 0.0 || visual_width <= 0.0 || letter_spacing < 0.0 {
-        return None;
+/// Returns a conservative replay envelope for text ops that may be culled.
+/// `None` means fail closed: replay the op and let the Canvas clip decide.
+fn partial_text_replay_bounds(op: &PaintOp) -> Option<BoundingBox> {
+    match op {
+        PaintOp::TextRun { bbox, run } => expanded_text_replay_bounds(
+            *bbox,
+            &run.style,
+            run.rotation,
+            run.is_vertical,
+            run.char_overlap.is_some(),
+        ),
+        PaintOp::FootnoteMarker { bbox, marker } => Some(expanded_plain_text_replay_bounds(
+            *bbox,
+            marker.base_font_size,
+        )),
+        _ => None,
     }
-    if pin_ascii_advance {
-        return Some((cluster_advance / visual_width).clamp(0.1, 2.0));
-    }
-    if visual_width > cluster_advance + 0.25 {
-        return Some((cluster_advance / visual_width).clamp(0.1, 1.0));
-    }
-    None
 }
 
 /// Hanyang-PUA 옛한글 코드포인트를 KS X 1026-1:2007 자모 시퀀스로 확장 (Task #528).
@@ -84,7 +82,8 @@ fn group_label_matches_replay_plane(
     }
 }
 use super::composer::{
-    decode_pua_overlap_number, expand_pua_render_text, pua_to_display_text, CharOverlapInfo,
+    char_overlap_size_ratio, decode_pua_overlap_number, expand_pua_render_text,
+    pua_to_display_text, CharOverlapInfo,
 };
 use super::form_caption::display_form_caption;
 #[cfg(target_arch = "wasm32")]
@@ -165,14 +164,38 @@ fn detect_image_mime_type(data: &[u8]) -> &'static str {
     } else if data.len() >= 2 && &data[0..2] == b"BM" {
         "image/bmp"
     } else if data.len() >= 4
+        && (data.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+            || data.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]))
+    {
+        "image/tiff"
+    } else if data.len() >= 4
         && (data.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A])
             || data.starts_with(&[0x01, 0x00, 0x09, 0x00]))
     {
         "image/x-wmf"
-    } else if data.len() >= 2 && data.starts_with(&[0x0A, 0x05]) {
-        // PCX: 0A 05 (ZSoft Paintbrush v3.0+, Task #514)
+    } else if data.len() >= 44
+        && data.starts_with(&[0x01, 0x00, 0x00, 0x00])
+        && &data[40..44] == b" EMF"
+    {
+        // EMF: EMR_HEADER(Type=1) + offset 40 의 " EMF" 시그니처 (MS-EMF 2.3.4.2)
+        "image/x-emf"
+    } else if data.len() >= 4
+        && (data.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+            || data.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]))
+    {
+        // TIFF: II*\0(LE)·MM\0*(BE). 브라우저 native 미지원 → PNG 변환 필요 (#4064)
+        "image/tiff"
+    } else if data.len() >= 3
+        && data[0] == 0x0A
+        && matches!(data[1], 0 | 2 | 3 | 4 | 5)
+        && data[2] == 0x01
+    {
+        // PCX: 0A + 버전바이트(0·2·3·4·5) + 인코딩 01 (Task #514, v2.8 은 #4065)
         // 브라우저 native 미지원 → emit 시 PNG 변환 필요 (svg::pcx_bytes_to_png_bytes)
         "image/x-pcx"
+    } else if data.starts_with(b"%!PS") || data.starts_with(&[0xC5, 0xD0, 0xD3, 0xC6]) {
+        // PostScript: 텍스트 EPS 와 DOS EPS 바이너리 — 후자는 내장 프리뷰 변환 가능 (#4062)
+        "application/postscript"
     } else if super::svg_fragment::is_svg_prefix(data) {
         // Task #275: RawSvg 래퍼 경로 — <svg 또는 <?xml + <svg
         "image/svg+xml"
@@ -350,6 +373,13 @@ pub struct WebCanvasRenderer {
     /// independent of raw tree child order.
     active_replay_plane: Option<PaintReplayPlane>,
     render_profile: RenderProfile,
+    /// [#3137 Stage 4] 기존 Canvas의 좁은 영역만 다시 그릴 때 사용하는 page-space clip.
+    ///
+    /// full render는 `None`을 유지한다. partial render는 canvas 크기를 바꾸지 않고
+    /// 이 영역만 clear/replay한다. text op는 layout bbox를 그대로 사용하지 않고
+    /// 보수적인 ink envelope와 겹치지 않을 때만 Canvas 호출 전에 건너뛴다.
+    partial_clip: Option<BoundingBox>,
+    partial_context_saved: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -372,6 +402,8 @@ impl WebCanvasRenderer {
             transparent_page_background: false,
             active_replay_plane: None,
             render_profile: RenderProfile::Screen,
+            partial_clip: None,
+            partial_context_saved: false,
         })
     }
 
@@ -383,6 +415,11 @@ impl WebCanvasRenderer {
     /// 다층 레이어 필터 설정 (Task #516, Stage 5.2)
     pub fn set_layer_filter(&mut self, filter: LayerFilter) {
         self.layer_filter = filter;
+    }
+
+    /// 기존 Canvas를 유지한 채 page-space의 좁은 영역만 다시 그린다.
+    pub fn set_partial_clip(&mut self, clip: BoundingBox) {
+        self.partial_clip = Some(clip);
     }
 
     /// PaintOp replay plane 이 현재 layer_filter 와 일치하는지 판정.
@@ -462,6 +499,10 @@ impl WebCanvasRenderer {
             self.active_replay_plane = prev;
         } else {
             self.render_layer_node(&tree.root, None);
+        }
+        if self.partial_context_saved {
+            self.ctx.restore();
+            self.partial_context_saved = false;
         }
         self.transparent_page_background = false;
     }
@@ -1117,7 +1158,9 @@ impl WebCanvasRenderer {
             if !self.render_profile.shows_editor_visuals() {
                 return;
             }
-            self.set_line_dash(&StrokeDash::Dash);
+            // 한글 편집 화면의 테두리는 굵은 파선이 아니라 잔 점선이다 — 오라클 화면
+            // 실측(2px on / 2px off)에 맞춘다. `svg.rs` 의 stroke-dasharray 와 같은 값.
+            self.set_line_dash(&StrokeDash::Dot);
             self.ctx.set_stroke_style_str("#999999");
             self.ctx.set_line_width(1.0);
             self.ctx
@@ -1334,6 +1377,18 @@ impl WebCanvasRenderer {
                     // Task #1197: 다층 레이어 필터 — RenderNode.layer 또는 이미지 wrap 기반
                     // replay plane 에 따라 skip.
                     if !self.should_render_op(op, active_layer) {
+                        continue;
+                    }
+                    // Layout bbox alone does not contain all glyph ink. Cull only plain text
+                    // whose expanded replay envelope is outside the clip; risky effects and
+                    // editor-only text marks fail closed and are always replayed.
+                    if !self.show_paragraph_marks
+                        && !self.show_control_codes
+                        && self.partial_clip.is_some_and(|clip| {
+                            partial_text_replay_bounds(op)
+                                .is_some_and(|bounds| !bounds.intersects(&clip))
+                        })
+                    {
                         continue;
                     }
                     self.render_paint_op(op);
@@ -1631,7 +1686,7 @@ impl WebCanvasRenderer {
         }
 
         let canvas_grad = match grad.gradient_type {
-            2 | 3 | 4 => {
+            2..=4 => {
                 // Radial / Conical / Square → radialGradient
                 let cx = x + w * (grad.center_x as f64 / 100.0);
                 let cy = y + h * (grad.center_y as f64 / 100.0);
@@ -1939,7 +1994,7 @@ impl WebCanvasRenderer {
             } else {
                 1.0
             };
-            let r = (shadow.color >> 0) & 0xFF;
+            let r = shadow.color & 0xFF;
             let g = (shadow.color >> 8) & 0xFF;
             let b = (shadow.color >> 16) & 0xFF;
             let color = format!("rgba({},{},{},{:.2})", r, g, b, opacity);
@@ -2124,11 +2179,23 @@ impl Renderer for WebCanvasRenderer {
     fn begin_page(&mut self, width: f64, height: f64) {
         self.width = width;
         self.height = height;
+        if self.partial_clip.is_some() {
+            self.ctx.save();
+            self.partial_context_saved = true;
+            let _ = self.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        }
         // 줌 스케일 적용: 렌더트리 좌표(문서 단위)를 캔버스 해상도에 맞게 확대
         if self.scale != 1.0 {
             let _ = self.ctx.scale(self.scale, self.scale);
         }
-        self.ctx.clear_rect(0.0, 0.0, width, height);
+        if let Some(clip) = self.partial_clip {
+            self.ctx.begin_path();
+            self.ctx.rect(clip.x, clip.y, clip.width, clip.height);
+            self.ctx.clip();
+            self.ctx.clear_rect(clip.x, clip.y, clip.width, clip.height);
+        } else {
+            self.ctx.clear_rect(0.0, 0.0, width, height);
+        }
         // 캔버스 초기화 (흰색 배경). 분리된 flow/behind/front layer 는
         // HTML 합성 순서가 페이지 배경을 담당하므로 투명하게 유지한다.
         if self.should_render_page_background() {
@@ -2164,14 +2231,7 @@ impl Renderer for WebCanvasRenderer {
         };
 
         // 위첨자/아래첨자: 글꼴 크기 축소 + y좌표 조정
-        let (font_size, y) = if style.superscript {
-            (base_font_size * 0.7, y - base_font_size * 0.3)
-        } else if style.subscript {
-            (base_font_size * 0.7, y + base_font_size * 0.15)
-        } else {
-            (base_font_size, y)
-        };
-
+        let (font_size, y) = style.script_draw_metrics(base_font_size, y);
         let font_family = super::canvas_font_family_chain(&style.font_family);
 
         let font = format!(
@@ -2195,8 +2255,7 @@ impl Renderer for WebCanvasRenderer {
         let char_positions = compute_char_positions(text, style);
 
         // 형광펜 배경 (CharShape.shade_color 기반 — 편집기에서 적용한 형광펜)
-        let shade_rgb = style.shade_color & 0x00FFFFFF;
-        if shade_rgb != 0x00FFFFFF && shade_rgb != 0 {
+        if crate::model::color::char_shade(style.shade_color).is_some() {
             let text_width = *char_positions.last().unwrap_or(&0.0);
             if text_width > 0.0 {
                 self.ctx
@@ -2268,6 +2327,24 @@ impl Renderer for WebCanvasRenderer {
                 &font,
                 &old_hangul_font,
             );
+            // 효과 pass에서는 raw PUA를 건너뛰고, 사각 안 숫자는 한 번만 합성한다.
+            // CanvasKit도 이 대역에 글리프가 없을 때 동일한 bounded vector fallback을 쓴다.
+            for (char_idx, cluster_str) in &clusters {
+                if cluster_str.chars().count() != 1 {
+                    continue;
+                }
+                let Some(number) = cluster_str.chars().next().and_then(super::boxed_pua_number)
+                else {
+                    continue;
+                };
+                self.draw_boxed_pua_number(
+                    number,
+                    x + char_positions[*char_idx],
+                    y,
+                    style,
+                    font_size,
+                );
+            }
         } else {
             // 기본 렌더링 (효과 없음)
             self.ctx.set_fill_style_str(&color_to_css(style.color));
@@ -2309,6 +2386,13 @@ impl Renderer for WebCanvasRenderer {
                 let char_x = x + char_positions[*char_idx];
 
                 let ch = cluster_str.chars().next().unwrap_or(' ');
+
+                if cluster_str.chars().count() == 1 {
+                    if let Some(number) = super::boxed_pua_number(ch) {
+                        self.draw_boxed_pua_number(number, char_x, y, style, font_size);
+                        continue;
+                    }
+                }
 
                 // 통화 기호 등 글리프 미포함 문자: 폴백 폰트로 임시 전환
                 let needs_font_fallback = matches!(
@@ -2358,10 +2442,10 @@ impl Renderer for WebCanvasRenderer {
                             .ok()
                             .map(|metrics| metrics.width())
                             .and_then(|actual_w| {
-                                canvas_cluster_fit_scale(
+                                super::canvas_cluster_fit_scale(
+                                    style,
                                     cluster_advance,
                                     actual_w * ratio,
-                                    style.letter_spacing,
                                     pin_ascii_advance,
                                 )
                             })
@@ -2388,9 +2472,12 @@ impl Renderer for WebCanvasRenderer {
             } else {
                 color_to_css(style.color)
             };
+            // [#5730] 아래 밑줄은 기준선 + 0.17em (한글 2022 프로브 실측, 고정
+            // 2.0px 은 큰 글꼴에서 디센더 관통). 선 모양 내부 기하는 캔버스 경로
+            // 현행 유지 — 오프셋만 SVG/Skia 와 같은 계약을 쓴다.
             let ul_y = match style.underline {
                 UnderlineType::Top => y - font_size + 1.0,
-                _ => y + 2.0,
+                _ => y + font_size * crate::renderer::text_decoration::UNDERLINE_BASELINE_RATIO,
             };
             self.draw_line_shape_canvas(
                 x,
@@ -2592,7 +2679,7 @@ impl Renderer for WebCanvasRenderer {
             } else {
                 1.0
             };
-            let r = (shadow.color >> 0) & 0xFF;
+            let r = shadow.color & 0xFF;
             let g = (shadow.color >> 8) & 0xFF;
             let b = (shadow.color >> 16) & 0xFF;
             self.ctx
@@ -2714,16 +2801,31 @@ impl Renderer for WebCanvasRenderer {
         let mime_type = detect_image_mime_type(data);
 
         // WMF → SVG 변환 (브라우저는 WMF를 렌더링할 수 없으므로 SVG로 변환)
-        // PCX → PNG 변환 (브라우저는 PCX 포맷을 native 렌더링하지 못함, Task #514)
+        // PCX/TIFF → PNG 변환 (브라우저는 native decoder를 안정적으로 제공하지 않음)
         let (render_data, render_mime): (std::borrow::Cow<[u8]>, &str) =
             if mime_type == "image/x-wmf" {
                 match crate::renderer::svg::convert_wmf_to_svg(data) {
                     Some(svg_bytes) => (std::borrow::Cow::Owned(svg_bytes), "image/svg+xml"),
                     None => (std::borrow::Cow::Borrowed(data), mime_type),
                 }
+            } else if mime_type == "image/x-emf" {
+                match crate::emf::convert_to_standalone_svg(data) {
+                    Some(svg_bytes) => (std::borrow::Cow::Owned(svg_bytes), "image/svg+xml"),
+                    None => (std::borrow::Cow::Borrowed(data), mime_type),
+                }
             } else if mime_type == "image/x-pcx" {
                 match crate::renderer::image_resolver::pcx_bytes_to_png_bytes(data) {
                     Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
+                    None => (std::borrow::Cow::Borrowed(data), mime_type),
+                }
+            } else if mime_type == "image/tiff" {
+                match crate::renderer::image_resolver::tiff_bytes_to_png_bytes(data) {
+                    Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
+                    None => (std::borrow::Cow::Borrowed(data), mime_type),
+                }
+            } else if mime_type == "application/postscript" {
+                match crate::renderer::image_resolver::eps_renderable_bytes(data) {
+                    Some((mime, bytes)) => (std::borrow::Cow::Owned(bytes), mime),
                     None => (std::borrow::Cow::Borrowed(data), mime_type),
                 }
             } else {
@@ -2861,6 +2963,15 @@ impl WebCanvasRenderer {
                 if cs == " " || cs == "\t" || cs == "\u{2007}" {
                     continue;
                 }
+                if cs.chars().count() == 1
+                    && cs
+                        .chars()
+                        .next()
+                        .and_then(super::boxed_pua_number)
+                        .is_some()
+                {
+                    continue;
+                }
                 if super::contains_old_hangul_jamo(cs) {
                     ctx.set_font(old_hangul_font);
                 } else {
@@ -2932,6 +3043,42 @@ impl WebCanvasRenderer {
         }
     }
 
+    /// CanvasKit의 missing-glyph 경로와 같은 사각 안 숫자 벡터 폴백.
+    fn draw_boxed_pua_number(
+        &self,
+        number: u32,
+        x: f64,
+        baseline_y: f64,
+        style: &TextStyle,
+        font_size: f64,
+    ) {
+        let box_size = (font_size * 0.72).max(1.0);
+        let box_y = baseline_y - font_size * 0.76;
+        let color = color_to_css(style.color);
+        let font_weight = if style.bold { "bold " } else { "" };
+        let font_style = if style.italic { "italic " } else { "" };
+        let font_family = super::canvas_font_family_chain(&style.font_family);
+        let number_font_size = (font_size * 0.5).max(1.0);
+
+        self.ctx.save();
+        self.ctx.set_stroke_style_str(&color);
+        self.ctx.set_fill_style_str(&color);
+        self.ctx.set_line_width((font_size * 0.04).max(0.6));
+        self.ctx.stroke_rect(x, box_y, box_size, box_size);
+        self.ctx.set_font(&format!(
+            "{}{}{:.3}px {}",
+            font_style, font_weight, number_font_size, font_family
+        ));
+        self.ctx.set_text_align("center");
+        self.ctx.set_text_baseline("alphabetic");
+        let _ = self.ctx.fill_text(
+            &number.to_string(),
+            x + box_size / 2.0,
+            box_y + box_size * 0.72,
+        );
+        self.ctx.restore();
+    }
+
     /// 글자겹침(CharOverlap)을 Canvas 2D로 렌더링한다.
     fn draw_char_overlap(
         &mut self,
@@ -2974,22 +3121,17 @@ impl WebCanvasRenderer {
         // 같은 중심에 겹쳐 그린다. table-vpos-01의 10/11/12 마커는
         // U+F02BA + U+F02C3/C4/C5 조합으로 저장된다.
         let box_size = font_size;
+        let boxed_pua = boxed_pua_char_overlap_semantics(&chars, overlap.border_type);
+        let effective_border = boxed_pua
+            .map(|(_, border_type)| border_type)
+            .unwrap_or(overlap.border_type);
 
-        let is_reversed = overlap.border_type == 2 || overlap.border_type == 4;
-        let is_circle = overlap.border_type == 1 || overlap.border_type == 2;
-        let is_rect = overlap.border_type == 3 || overlap.border_type == 4;
+        let is_reversed = effective_border == 2 || effective_border == 4;
+        let is_circle = effective_border == 1 || effective_border == 2;
+        let is_rect = effective_border == 3 || effective_border == 4;
 
-        // inner_char_size 해석:
-        //   > 0 → percent ratio (HWPX 양수 case 보존)
-        //   < 0 → 10% step 축소 (한컴 정합: charSz=-3 → 0.70)
-        //   == 0 → 기본 100%
-        let size_ratio = if overlap.inner_char_size > 0 {
-            overlap.inner_char_size as f64 / 100.0
-        } else if overlap.inner_char_size < 0 {
-            1.0 + overlap.inner_char_size as f64 * 0.10
-        } else {
-            1.0
-        };
+        // charSz 는 "테두리 내부" 글자 비율이므로 테두리를 안 그리면 적용하지 않는다 (#4085).
+        let size_ratio = char_overlap_size_ratio(effective_border, overlap.inner_char_size);
         let inner_font_size = font_size * size_ratio;
 
         // 동그라미 테두리 색 = 글자색 (한컴 정합). reversed는 기존대로 검정 채움.
@@ -3064,7 +3206,9 @@ impl WebCanvasRenderer {
         }
 
         for (i, ch) in chars.iter().enumerate() {
-            let display_str = {
+            let display_str = if let Some((number, _)) = boxed_pua {
+                number.to_string()
+            } else {
                 let cp = *ch as u32;
                 if (0x2460..=0x2473).contains(&cp) {
                     format!("{}", cp - 0x2460 + 1)
@@ -3144,14 +3288,9 @@ impl WebCanvasRenderer {
         let is_circle = effective_border == 1 || effective_border == 2;
         let is_rect = effective_border == 3 || effective_border == 4;
 
-        // inner_char_size 해석 (draw_char_overlap와 동일 — 음수=10% step 축소)
-        let size_ratio = if overlap.inner_char_size > 0 {
-            overlap.inner_char_size as f64 / 100.0
-        } else if overlap.inner_char_size < 0 {
-            1.0 + overlap.inner_char_size as f64 * 0.10
-        } else {
-            1.0
-        };
+        // draw_char_overlap와 동일 규칙. 여기서는 effective_border 가 0이 아니므로
+        // (border_type=0 → 원형 승격) 축소 게이트에 걸리지 않는다 (#4085).
+        let size_ratio = char_overlap_size_ratio(effective_border, overlap.inner_char_size);
         let inner_font_size = font_size * size_ratio;
 
         let glyph_color = color_to_css(style.color);
@@ -3303,7 +3442,7 @@ impl WebCanvasRenderer {
         while cx < x2 {
             let next = (cx + wave_w).min(x2);
             let cy = if up { y1 - wave_h } else { y1 + wave_h };
-            let _ = self.ctx.quadratic_curve_to((cx + next) / 2.0, cy, next, y1);
+            self.ctx.quadratic_curve_to((cx + next) / 2.0, cy, next, y1);
             cx = next;
             up = !up;
         }
@@ -3666,18 +3805,5 @@ mod tests {
         assert_eq!(color_to_css(0x00FF0000), "#0000ff"); // 파랑
         assert_eq!(color_to_css(0x00FFFFFF), "#ffffff"); // 흰색
         assert_eq!(color_to_css(0x00000000), "#000000"); // 검정
-    }
-
-    #[test]
-    fn issue_2809_negative_letter_spacing_does_not_compress_glyph() {
-        assert_eq!(canvas_cluster_fit_scale(7.5, 15.0, -7.5, false), None);
-        assert_eq!(canvas_cluster_fit_scale(7.5, 15.0, -7.5, true), None);
-    }
-
-    #[test]
-    fn non_negative_letter_spacing_keeps_existing_font_fit_policy() {
-        assert_eq!(canvas_cluster_fit_scale(7.5, 15.0, 0.0, false), Some(0.5));
-        assert_eq!(canvas_cluster_fit_scale(7.5, 15.0, 0.0, true), Some(0.5));
-        assert_eq!(canvas_cluster_fit_scale(15.0, 14.9, 0.0, false), None);
     }
 }

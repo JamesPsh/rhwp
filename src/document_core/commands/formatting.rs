@@ -22,6 +22,63 @@ fn char_shape_mods_affect_text_flow(mods: &crate::model::style::CharShapeMods) -
         || mods.char_offsets.is_some()
 }
 
+/// [#4324] `ParaShapeMods` 변경이 줄바꿈(LineSeg 재계산)에 영향을 주는지 판정한다.
+/// `char_shape_mods_affect_text_flow`(:16)의 문단모양 대응물 — 형태를 그대로 따른다.
+///
+/// 전수 조사(reflow_line_segs/fill_lines, composer/line_breaking.rs 가 실제로 읽는
+/// 입력만 기준으로 판정, #4324 보고 참고):
+/// - `margin_left`/`margin_right`: 호출부가 `available_width = 폭 - margin_left -
+///   margin_right`로 사용 가능 폭을 좁힌다(:25-46, reflow_cell_paragraph
+///   text_editing.rs:2245-2247).
+/// - `indent`: `fill_lines`의 `eff_w()`가 첫 줄(또는 이어줄) 유효 폭을 들여쓰기만큼
+///   줄인다(line_breaking.rs:681-696).
+/// - `english_break_unit`/`korean_break_unit`: `tokenize_paragraph`/`fill_lines`가 토큰
+///   경계 자체(영어 단어/하이픈/글자, 한글 글자 단위 break 허용)를 바꾼다
+///   (line_breaking.rs:360, 375, 798).
+/// - `line_spacing`/`line_spacing_type`: 원래 게이트 — `reflow_line_segs`가 LineSeg별
+///   `line_spacing` 값을 다시 계산하므로 유지한다.
+///
+/// 나머지 필드(alignment, spacing_before/after, head_type, para_level, widow_orphan,
+/// keep_with_next, keep_lines, page_break_before, font_line_height, single_line,
+/// auto_space_kr_en/num, vertical_align, tab_def_id, numbering_id, border_fill_id,
+/// border_spacing, border_connect, border_ignore_margin)는 `reflow_line_segs`/
+/// `fill_lines`가 읽지 않는다 — 정렬은 이미 배치된 줄 안에서의 렌더링 배분일 뿐이고,
+/// 문단 테두리/배경은 레이아웃 완료 후 장식 사각형으로만 그려지며(layout.rs
+/// render_para_border_groups), 문단 간격·쪽나눔 휴리스틱은 `rebuild_section`이 매번
+/// 다시 계산하는 vpos/페이지네이션 단계에서 처리된다. `tab_def_id`는 현재
+/// `resolve_single_para_style`이 `default_tab_width`를 4000 HWPUNIT 상수로 고정해
+/// 두므로(별개 결함 가능성, 이 이슈 범위 밖) 오늘 시점 코드에서 흐름에 영향이 없다.
+pub(super) fn para_shape_mods_affect_text_flow(mods: &crate::model::style::ParaShapeMods) -> bool {
+    mods.line_spacing.is_some()
+        || mods.line_spacing_type.is_some()
+        || mods.margin_left.is_some()
+        || mods.margin_right.is_some()
+        || mods.indent.is_some()
+        || mods.english_break_unit.is_some()
+        || mods.korean_break_unit.is_some()
+}
+
+/// 문단 하나를 주어진 영역 폭으로 다시 접는다. 영역 폭에서 그 문단의 좌우 여백을 뺀 것이
+/// 실제 줄 폭이다.
+fn reflow_paragraph_to_width(
+    para: &mut Paragraph,
+    area_width: f64,
+    styles: &ResolvedStyleSet,
+    dpi: f64,
+) {
+    let para_style = styles.para_styles.get(para.para_shape_id as usize);
+    let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
+    let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
+    para.line_segs.clear();
+    para.invalidate_single_line_overflow_memo();
+    reflow_line_segs(
+        para,
+        (area_width - margin_left - margin_right).max(1.0),
+        styles,
+        dpi,
+    );
+}
+
 fn body_available_width_for_para_shape(
     core: &DocumentCore,
     sec_idx: usize,
@@ -780,21 +837,16 @@ impl DocumentCore {
                 };
                 // 원본 ParaShape에서 attr 비트 추출
                 let (a1, a2) = raw_ps.map(|r| (r.attr1, r.attr2)).unwrap_or((0, 0));
-                // 바이너리: attr1, HWPX: attr2 — OR 조합으로 양쪽 지원
-                let widow_orphan = ((a1 >> 16) & 1 != 0) || ((a2 >> 5) & 1 != 0);
-                let keep_with_next = ((a1 >> 17) & 1 != 0) || ((a2 >> 6) & 1 != 0);
-                let keep_lines = ((a1 >> 18) & 1 != 0) || ((a2 >> 7) & 1 != 0);
-                let page_break_before = ((a1 >> 19) & 1 != 0) || ((a2 >> 8) & 1 != 0);
+                // #2777 정본: breakSetting은 attr1 16-19, autoSpacing은 attr2 4/5.
+                let widow_orphan = (a1 >> 16) & 1 != 0;
+                let keep_with_next = (a1 >> 17) & 1 != 0;
+                let keep_lines = (a1 >> 18) & 1 != 0;
+                let page_break_before = (a1 >> 19) & 1 != 0;
                 let font_line_height = (a1 >> 22) & 1 != 0;
                 let single_line = (a2 & 0x03) != 0;
-                let auto_space_kr_en = ((a2 >> 4) & 1 != 0) || ((a1 >> 20) & 1 != 0);
-                let auto_space_kr_num = ((a2 >> 5) & 1 != 0) || ((a1 >> 21) & 1 != 0);
-                // verticalAlign: attr1 bits 20-21 (autoSpacing과 충돌 시 0)
-                let vertical_align = if !auto_space_kr_en && !auto_space_kr_num {
-                    (a1 >> 20) & 0x03
-                } else {
-                    0
-                };
+                let auto_space_kr_en = (a2 >> 4) & 1 != 0;
+                let auto_space_kr_num = (a2 >> 5) & 1 != 0;
+                let vertical_align = (a1 >> 20) & 0x03;
                 let english_break_unit = (a1 >> 5) & 0x03;
                 let korean_break_unit = (a1 >> 7) & 0x01;
                 let border_connect = (a1 >> 28) & 1 != 0;
@@ -1419,8 +1471,10 @@ impl DocumentCore {
         let new_id = self.document.find_or_create_para_shape(base_id, &mods);
         self.document.sections[sec_idx].paragraphs[para_idx].para_shape_id = new_id;
 
-        // 줄간격 변경 시 LineSeg 재계산 (compose는 LineSeg 값을 그대로 사용하므로)
-        if mods.line_spacing.is_some() || mods.line_spacing_type.is_some() {
+        // 줄바꿈에 영향을 주는 변경 시 LineSeg 재계산 (compose는 LineSeg 값을 그대로
+        // 사용하므로). 줄간격뿐 아니라 여백/들여쓰기/줄나눔 단위도 사용 가능 폭·토큰
+        // 경계를 바꾼다 — [#4324] para_shape_mods_affect_text_flow(:16 부근) 참고.
+        if para_shape_mods_affect_text_flow(&mods) {
             let styles = resolve_styles(&self.document.doc_info, self.dpi);
             let section = &self.document.sections[sec_idx];
             let page_def = &section.section_def.page_def;
@@ -1584,12 +1638,16 @@ impl DocumentCore {
             cell_para.para_shape_id = new_id;
         }
 
-        // 줄간격 변경 시 셀 내 문단 LineSeg 재계산.
+        // 줄바꿈에 영향을 주는 변경 시 셀 내 문단 LineSeg 재계산.
         //
         // [자체 발견] apply_char_format_in_cell_native 와 동일한 결함 — 페이지 본문 단 폭을
         // 셀 리플로우에 썼다. undo 형제 set_cell_para_shape_id_native(:1538)는 이미
         // reflow_cell_paragraph 를 쓴다. 그 헬퍼로 통일해 폭 계산과 dirty 마킹을 함께 맞춘다.
-        if mods.line_spacing.is_some() || mods.line_spacing_type.is_some() {
+        //
+        // [#4324] 게이트가 줄간격만 보고 여백/들여쓰기/줄나눔 단위를 놓쳤다 — 이 값들도
+        // reflow_cell_paragraph 가 계산하는 사용 가능 폭·토큰 경계에 실제로 쓰인다.
+        // para_shape_mods_affect_text_flow(:16 부근)로 판정을 통일한다.
+        if para_shape_mods_affect_text_flow(&mods) {
             self.reflow_cell_paragraph(
                 sec_idx,
                 parent_para_idx,
@@ -1814,6 +1872,54 @@ impl DocumentCore {
             para.line_segs.clear();
             reflow_line_segs(para, available_width, &styles, self.dpi);
         }
+    }
+
+    /// 구역의 본문 문단 전부를 현재 용지/단 기준으로 다시 접는다 — 쪽 설정이 바뀌어 본문
+    /// 폭 자체가 달라졌을 때 쓴다.
+    ///
+    /// 비우기만 하고 재계산을 조판에 맡기면 안 된다. 저장 분할이 없는 문단은 조판에서
+    /// NO_LS 계급이 되는데, 그 계급은 쪽 나눔에서 문단 위 간격을 0 으로 세고(typeset.rs 의
+    /// `para.line_segs.is_empty()` 분기) 렌더는 그대로 그린다 — 여백을 조금만 건드려도
+    /// 쪽 나눔과 그리기가 문단마다 spacing_before 만큼 어긋난다.
+    ///
+    /// 문단 하나짜리 `reflow_body_paragraph` 를 문단 수만큼 부르면 `resolve_styles` 와
+    /// `PageLayoutInfo` 계산이 그만큼 반복된다. 둘 다 한 번만 하고 문단별 여백만 뺀다.
+    ///
+    /// 본문 문단만 다룬다. 표 셀은 폭의 주인이 표라서 제외하고, 머리말·꼬리말은 폭이 본문과
+    /// 같지만(`header_area`/`footer_area` 가 같은 `content_left..content_right`) 여기서 건드릴
+    /// 필요가 없다 — 합성 경로가 저장 분할과 무관하게 영역 폭으로 다시 접는다. 실측: 저장
+    /// 분할 1줄 그대로인 꼬리말이 본문을 절반으로 좁힌 뒤에도 렌더에서 386.7px 로 본문
+    /// 오른쪽 끝(396.9px) 안에 들어온다 (samples/hwp3-sample19-hwp5.hwp).
+    pub(crate) fn reflow_body_paragraphs_in_section(&mut self, sec_idx: usize) {
+        let styles = resolve_styles(&self.document.doc_info, self.dpi);
+        let dpi = self.dpi;
+        let wrap_width = self.body_wrap_width(sec_idx);
+        let Some(section) = self.document.sections.get_mut(sec_idx) else {
+            return;
+        };
+        for para in section.paragraphs.iter_mut() {
+            reflow_paragraph_to_width(para, wrap_width, &styles, dpi);
+        }
+    }
+
+    /// 이 구역의 본문 문단이 접히는 폭 (px) — 단이 나뉘어 있으면 첫 단 폭, 아니면 본문 상자 폭.
+    ///
+    /// "줄 나눔을 정하는 폭"의 정의는 하나여야 한다. 저장 분할을 버릴지 판단하는 곳(쪽 설정·단
+    /// 설정 변경)과 실제로 다시 접는 곳이 각자 계산하면, 제본 여백·가로세로 뒤바꿈·여백 과대
+    /// 폴백 같은 규칙이 한쪽에만 반영돼 "바뀐 줄 모르고 안 접거나, 안 바뀐 걸 접는" 어긋남이
+    /// 생긴다.
+    pub(crate) fn body_wrap_width(&self, sec_idx: usize) -> f64 {
+        let Some(section) = self.document.sections.get(sec_idx) else {
+            return 0.0;
+        };
+        let column_def = DocumentCore::find_initial_column_def(&section.paragraphs);
+        let layout =
+            PageLayoutInfo::from_page_def(&section.section_def.page_def, &column_def, self.dpi);
+        layout
+            .column_areas
+            .first()
+            .map(|a| a.width)
+            .unwrap_or(layout.body_area.width)
     }
 
     /// 스타일 적용 (네이티브) — 본문 문단
@@ -2188,10 +2294,10 @@ impl DocumentCore {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_shape_mods_affect_text_flow, DocumentCore};
+    use super::{char_shape_mods_affect_text_flow, para_shape_mods_affect_text_flow, DocumentCore};
     use crate::model::control::Control;
     use crate::model::paragraph::{CharShapeRef, Paragraph};
-    use crate::model::style::CharShapeMods;
+    use crate::model::style::{CharShapeMods, ParaShapeMods};
     use crate::model::table::{Cell, Table};
 
     #[test]
@@ -2216,6 +2322,116 @@ mod tests {
             ..Default::default()
         };
         assert!(!char_shape_mods_affect_text_flow(&mods));
+    }
+
+    /// [#4324] margin/indent/줄나눔 단위 변경도 사용 가능 폭·토큰 경계를 바꾸므로
+    /// 줄간격과 마찬가지로 리플로우가 필요하다.
+    #[test]
+    fn para_margin_indent_and_break_unit_changes_require_text_reflow() {
+        let mods = ParaShapeMods {
+            margin_left: Some(8000),
+            ..Default::default()
+        };
+        assert!(para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            margin_right: Some(4000),
+            ..Default::default()
+        };
+        assert!(para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            indent: Some(2000),
+            ..Default::default()
+        };
+        assert!(para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            english_break_unit: Some(1),
+            ..Default::default()
+        };
+        assert!(para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            korean_break_unit: Some(1),
+            ..Default::default()
+        };
+        assert!(para_shape_mods_affect_text_flow(&mods));
+
+        // 기존에 이미 게이트하던 줄간격도 계속 포함해야 한다 (회귀 방지).
+        let mods = ParaShapeMods {
+            line_spacing: Some(150),
+            ..Default::default()
+        };
+        assert!(para_shape_mods_affect_text_flow(&mods));
+        let mods = ParaShapeMods {
+            line_spacing_type: Some(crate::model::style::LineSpacingType::Fixed),
+            ..Default::default()
+        };
+        assert!(para_shape_mods_affect_text_flow(&mods));
+    }
+
+    /// [#4324] 정렬/문단테두리/문단간격/쪽나눔 휴리스틱 등은 `reflow_line_segs`가
+    /// 읽지 않는 입력이다 — 리플로우를 요구하면 안 된다(전수 조사 결과, 판정 근거는
+    /// `para_shape_mods_affect_text_flow` 문서 주석 참고).
+    #[test]
+    fn para_shape_changes_without_flow_impact_do_not_require_text_reflow() {
+        let mods = ParaShapeMods {
+            alignment: Some(crate::model::style::Alignment::Center),
+            ..Default::default()
+        };
+        assert!(!para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            spacing_before: Some(1000),
+            spacing_after: Some(1000),
+            ..Default::default()
+        };
+        assert!(!para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            widow_orphan: Some(true),
+            keep_with_next: Some(true),
+            keep_lines: Some(true),
+            page_break_before: Some(true),
+            ..Default::default()
+        };
+        assert!(!para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            border_fill_id: Some(3),
+            border_spacing: Some([100, 100, 100, 100]),
+            border_connect: Some(true),
+            border_ignore_margin: Some(true),
+            ..Default::default()
+        };
+        assert!(!para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            head_type: Some(crate::model::style::HeadType::Number),
+            para_level: Some(1),
+            numbering_id: Some(1),
+            ..Default::default()
+        };
+        assert!(!para_shape_mods_affect_text_flow(&mods));
+
+        // tab_def_id: 현재 resolve_single_para_style이 default_tab_width를 상수로 고정해
+        // 두므로(별개 결함), 오늘 시점 코드 기준으로는 흐름에 영향이 없다.
+        let mods = ParaShapeMods {
+            tab_def_id: Some(2),
+            ..Default::default()
+        };
+        assert!(!para_shape_mods_affect_text_flow(&mods));
+
+        let mods = ParaShapeMods {
+            font_line_height: Some(true),
+            single_line: Some(true),
+            auto_space_kr_en: Some(true),
+            auto_space_kr_num: Some(true),
+            vertical_align: Some(1),
+            ..Default::default()
+        };
+        assert!(!para_shape_mods_affect_text_flow(&mods));
     }
 
     #[test]
@@ -2343,6 +2559,15 @@ mod cell_reflow_width_tests {
     use crate::model::table::{Cell, Table};
 
     fn core_with_narrow_cell(text: &str) -> DocumentCore {
+        // 셀 폭 200 HWPUNIT — 페이지 본문 폭(수만 HWPUNIT)의 1% 미만.
+        core_with_cell(text, 200)
+    }
+
+    /// [#4324] `core_with_narrow_cell`의 셀 폭 파라미터화 버전. 200 HWPUNIT (약 2.7px)
+    /// 는 어떤 텍스트든 이미 1글자/줄로 포화돼 있어 margin/indent를 더 좁혀도 줄 수가
+    /// 늘어나는 걸 관찰할 여지가 없다 — margin 변화 전후 비교 테스트는 더 넓은 폭이
+    /// 필요해 파라미터화한다.
+    fn core_with_cell(text: &str, cell_width: u32) -> DocumentCore {
         let mut doc = Document::default();
 
         let mut cell_para = Paragraph {
@@ -2369,7 +2594,7 @@ mod cell_reflow_width_tests {
             col: 0,
             col_span: 1,
             row_span: 1,
-            width: 200, // 셀 폭 — 페이지 본문 폭(수만 HWPUNIT)의 1% 미만
+            width: cell_width,
             paragraphs: vec![cell_para],
             ..Default::default()
         }];
@@ -2492,6 +2717,86 @@ mod cell_reflow_width_tests {
         assert!(
             line_count > 1,
             "셀 폭(200 HWPUNIT)으로 리플로우했다면 40자가 여러 줄로 나뉘어야 함              (실제 {line_count}줄 — 페이지 본문 폭을 쓰면 1줄로 뭉친다)"
+        );
+    }
+
+    /// [#4324] 재현 테스트 — 여백(marginLeft) 변경 전후 줄바꿈 결과 비교.
+    ///
+    /// 이슈 실측 프로브와 동일한 축척을 쓴다: 셀 폭 20000 HWPUNIT(≈266.7px, 이슈의
+    /// "266.1px" 실측과 정합), `marginLeft: 8000`(≈53.3px 축소, 이슈의 "212.8px" 실측과
+    /// 정합). 고정폭 게이트(line_spacing만 보던 옛 조건)에서는 marginLeft 변경이
+    /// `reflow_cell_paragraph`를 호출하지 않아 LineSeg 경계가 그대로 남는다 — 줄
+    /// 상자만 좁아지고 글자 수는 그대로인 원본 결함을 그대로 재현한다.
+    ///
+    /// 먼저 `reflow_cell_paragraph`를 직접 호출해 "여백 0" 기준선을 실제로 셀 폭으로
+    /// 계산한 뒤, `marginLeft` 적용 전/후의 줄 수를 비교한다.
+    #[test]
+    fn para_format_margin_left_change_triggers_cell_reflow_and_rewraps() {
+        let text = "A".repeat(200);
+        let mut core = core_with_cell(&text, 20000);
+
+        // 기준선: 여백 0 상태에서 실제 셀 폭(20000 HWPUNIT)으로 먼저 리플로우한다.
+        core.reflow_cell_paragraph(0, 0, 0, 0, 0);
+        let before_lines = {
+            let table = match &core.document.sections[0].paragraphs[0].controls[0] {
+                Control::Table(t) => t,
+                _ => panic!("표 컨트롤이어야 함"),
+            };
+            table.cells[0].paragraphs[0].line_segs.len()
+        };
+
+        // 이슈 실측과 동일한 marginLeft(8000)를 적용한다 — 사용 가능 폭이 ≈53.3px 줄어든다.
+        core.apply_para_format_in_cell_native(0, 0, 0, 0, 0, r#"{"marginLeft":8000}"#)
+            .expect("서식 적용이 성공해야 함");
+        let after_lines = {
+            let table = match &core.document.sections[0].paragraphs[0].controls[0] {
+                Control::Table(t) => t,
+                _ => panic!("표 컨트롤이어야 함"),
+            };
+            table.cells[0].paragraphs[0].line_segs.len()
+        };
+
+        assert!(
+            after_lines > before_lines,
+            "marginLeft 적용으로 사용 가능 폭이 줄었으면 줄 수가 늘어야 함 \
+             (before={before_lines}줄, after={after_lines}줄 — 게이트가 marginLeft를 놓치면 \
+             after==before로 남는다)"
+        );
+    }
+
+    /// [#4324] 재현 테스트 — `indent`(들여쓰기) 변경도 marginLeft와 동일하게
+    /// `fill_lines`의 유효 폭을 줄이므로 리플로우를 유발해야 한다.
+    #[test]
+    fn para_format_indent_change_triggers_cell_reflow_and_rewraps() {
+        let text = "A".repeat(200);
+        let mut core = core_with_cell(&text, 20000);
+
+        core.reflow_cell_paragraph(0, 0, 0, 0, 0);
+        let before_lines = {
+            let table = match &core.document.sections[0].paragraphs[0].controls[0] {
+                Control::Table(t) => t,
+                _ => panic!("표 컨트롤이어야 함"),
+            };
+            table.cells[0].paragraphs[0].line_segs.len()
+        };
+
+        // indent는 첫 줄 유효 폭만 줄이므로(line_breaking.rs eff_w), margin과 달리 값이
+        // 작으면 재배치가 뒤 줄로 흡수돼 총 줄 수가 그대로일 수 있다. 셀 폭(20000)에
+        // 근접한 큰 값을 써서 첫 줄이 거의 비워지도록 만들어 확실히 줄 수를 늘린다.
+        core.apply_para_format_in_cell_native(0, 0, 0, 0, 0, r#"{"indent":19000}"#)
+            .expect("서식 적용이 성공해야 함");
+        let after_lines = {
+            let table = match &core.document.sections[0].paragraphs[0].controls[0] {
+                Control::Table(t) => t,
+                _ => panic!("표 컨트롤이어야 함"),
+            };
+            table.cells[0].paragraphs[0].line_segs.len()
+        };
+
+        assert!(
+            after_lines > before_lines,
+            "indent 적용으로 첫 줄 유효 폭이 줄었으면 줄 수가 늘어야 함 \
+             (before={before_lines}줄, after={after_lines}줄)"
         );
     }
 

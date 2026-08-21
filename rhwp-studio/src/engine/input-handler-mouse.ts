@@ -2,6 +2,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import type { ContextMenuItem } from '@/ui/context-menu';
+import { chartTargetFromSelection, matchChartRef } from '@/core/chart-data-target';
 import * as _connector from './input-handler-connector';
 import { MoveLineEndpointCommand } from './command';
 import { computeLineEndpointRecord } from './object-drag-record';
@@ -1346,6 +1347,20 @@ export function onDblClick(this: any, e: MouseEvent): void {
       this.eventBus.emit('equation-edit-request', { sec: ref.sec, ppi: ref.ppi, ci: ref.ci });
       return;
     }
+    // [#4694] 차트(ole) 객체 → 차트 데이터 편집 대화상자 (한컴 더블클릭 UX 동형).
+    // 대조 실패(차트 아님·미지원 컨테이너)면 기존처럼 아무 동작 없음.
+    if (ref && ref.type === 'ole') {
+      let editable = false;
+      try {
+        const target = chartTargetFromSelection(ref);
+        editable = target !== null && matchChartRef(this.wasm.listCharts(), target) !== null;
+      } catch { editable = false; }
+      if (editable) {
+        e.preventDefault();
+        this.eventBus.emit('chart-data-edit-request');
+        return;
+      }
+    }
     // 글상자 객체 → 텍스트 편집 진입
     if (ref && ref.type === 'shape') {
       e.preventDefault();
@@ -1962,7 +1977,12 @@ function bringShapeToFront(this: any, picHit: any): void {
       // [Task #2759] 선택 시 z순서 변경도 문서 뮤테이션 — 메뉴 정렬(insert.ts:427 등)의
       // recordObjectMutation 과 동형으로 snapshot 기록해 undo 가능·redo 무효화·스냅샷 undo
       // 동반 파괴를 막는다. UI 후처리(선택 진입·재렌더)는 호출부가 기존대로 수행한다.
-      const pos = this.getCursorPosition();
+      // [Task #3351] 메뉴 경로와 같은 이유로 캐럿은 **개체 인접**을 기록한다. 여기서
+      // `getCursorPosition()` 을 잡으면 클릭 직전 캐럿(문서 상단일 수도 있다)이 남아 undo 가
+      // 조작과 무관한 자리로 착지한다. 이 지점은 선택 진입 **전**이라 선택 상태를 읽을 수 없어
+      // 클릭된 개체의 ref 로 위치를 구한다.
+      const pos = this.cursor.positionOutsideObject(picHit.sec, picHit.ppi)
+        ?? this.getCursorPosition();
       this.executeOperation({
         kind: 'snapshot',
         operationType: 'changeZOrder',

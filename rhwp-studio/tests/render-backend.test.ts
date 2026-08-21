@@ -11,6 +11,7 @@ import {
   resolveRenderProfile,
 } from '../src/view/render-backend.ts';
 import {
+  boundedCanvasKitSourceImageKey,
   canvasKitImageCacheKey,
   canvasKitImageFillModeTiles,
   canvasKitImageFillModeStretches,
@@ -80,13 +81,13 @@ test('CanvasKit readiness classification keeps new diagnostic suffixes unexpecte
   for (const expected of [
     'glyphOutline:unsupportedColorGlyph',
     'imageEffect:grayScale',
-    'textRun:verticalText',
   ]) {
     assert.equal(isExpectedCanvasKitUnsupportedOp(expected), true, expected);
   }
   for (const unexpected of [
     'glyphOutline:replayInvariant',
     'imageEffect:futureEffect',
+    'textRun:verticalText',
     'textRun:newCoverageGap',
     'renderPage',
     'unknown',
@@ -181,22 +182,31 @@ test('CanvasKit text replay uses positioned fallback glyphs and external text vi
   assert.doesNotMatch(source, /case 'charOverlap':[\s\S]{0,200}unsupportedOps\.add\(op\.type\)/);
 });
 
-test('CanvasKit auto preflight permits text marks but blocks missing structural control markers', () => {
+test('CanvasKit auto preflight permits text marks and structural control markers', () => {
   const source = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /viewOption:showParagraphMarks/);
-  assert.match(source, /viewOption:showControlCodes/);
+  assert.doesNotMatch(source, /viewOption:showControlCodes/);
 });
 
 test('CanvasKit contains malformed images and bounds both decode caches', () => {
   const source = readFileSync(new URL('../src/view/canvaskit-renderer.ts', import.meta.url), 'utf8');
+  const admissionSource = readFileSync(
+    new URL('../src/view/canvaskit/image-header.ts', import.meta.url),
+    'utf8',
+  );
   assert.match(source, /try \{\s*image = this\.canvasKit\.MakeImageFromEncoded/);
   assert.match(source, /image:decodeFailed/);
   assert.match(source, /MAX_IMAGE_CACHE_ENTRIES = 128/);
   assert.match(source, /MAX_IMAGE_FAILURE_CACHE_ENTRIES = 128/);
-  assert.match(source, /encodedImageDimensions\(bytes\)/);
-  assert.match(source, /MAX_DECODED_IMAGE_PIXELS = 32 \* 1024 \* 1024/);
+  assert.match(source, /replayableEncodedImageHeader\(bytes\)/);
+  assert.match(admissionSource, /CANVASKIT_MAX_IMAGE_DIMENSION = 8192/);
+  assert.match(admissionSource, /CANVASKIT_MAX_DECODED_IMAGE_PIXELS = 32 \* 1024 \* 1024/);
   assert.match(source, /MAX_IMAGE_CACHE_PIXELS = 64 \* 1024 \* 1024/);
   assert.match(source, /oldest\?\.image\.delete\?\.\(\)/);
+  assert.match(source, /'base64DecodeFailed'/);
+  assert.match(source, /'encodedImageRejected'/);
+  assert.match(source, /'decodedDimensionsMismatch'/);
+  assert.match(source, /imageFailureCacheHits/);
   assert.match(source, /generation !== this\.documentGeneration/);
   assert.match(source, /resetDocumentResources\(\): void/);
 });
@@ -305,7 +315,22 @@ test('PageRenderer uses filtered canvas layers for background, behind, and front
   assert.match(source, /createOrReuseFilteredCanvasLayer\(\s*pageIdx,\s*canvas,\s*renderScale,\s*'front'/);
   assert.match(source, /createFilteredCanvasLayer\(\s*pageIdx,\s*sourceCanvas,\s*renderScale,\s*layerKind,/);
   assert.match(source, /layer\.style\.background\s*=\s*'transparent'/);
-  assert.match(source, /collectLayerPlaneSummary\(root,\s*summary,\s*null\)/);
+  // [#5763] 트리 폴백 경로도 flow-static 가림 판정을 함께 누적한다.
+  assert.match(source, /collectLayerPlaneSummary\(root,\s*summary,\s*null,\s*\{\s*opaqueFlowFills:\s*\[\]\s*\}\)/);
+});
+
+test('[#5763] PageRenderer skips the flow-static split when an opaque flow fill sits under a flow image', () => {
+  const source = readFileSync(new URL('../src/view/page-renderer.ts', import.meta.url), 'utf8');
+  // 요약에 판정 필드가 있고, 분리 결정이 그 값을 본다.
+  assert.match(source, /flowStaticOccluded: boolean;/);
+  assert.match(source, /!layers\.flowStaticOccluded/);
+  // 좁은 질의(WASM 요약)에서 읽고, 없으면(구형 WASM) 종전대로 분리를 허용한다.
+  assert.match(source, /wrapper\.flowStaticOccluded === true/);
+  // 캐시 서명에 포함돼야 판정이 바뀌었을 때 재계산된다.
+  assert.match(source, /flowStaticOccluded \? 1 : 0/);
+  // 트리 폴백도 같은 규칙(불투명 채우기 → 겹치는 그림)을 쓴다.
+  assert.match(source, /function opaqueFlowFillBbox\(/);
+  assert.match(source, /scan\.opaqueFlowFills\.some\(/);
 });
 
 test('CanvasKit and comparison canvas bitmap extents preserve fractional page edges', () => {
@@ -348,6 +373,21 @@ test('CanvasView forwards text-edit invalidation as static overlay reuse context
   assert.match(source, /allowStaticOverlayReuse:\s*false/);
   assert.match(source, /renderCanvas\(pageIndex,\s*canvas,\s*renderContext\)/);
   assert.match(source, /renderPage\(pageIdx,\s*canvas,\s*renderScale,\s*zoom,\s*dpr,\s*renderContext\)/);
+});
+
+test('#3137 stable text edit forwards a validated focused patch to partial Canvas replay', () => {
+  const canvasView = readFileSync(new URL('../src/view/canvas-view.ts', import.meta.url), 'utf8');
+  const pageRenderer = readFileSync(new URL('../src/view/page-renderer.ts', import.meta.url), 'utf8');
+  const wasmBridge = readFileSync(new URL('../src/core/wasm-bridge.ts', import.meta.url), 'utf8');
+
+  assert.match(canvasView, /'focusedPagePatch' in payload/);
+  assert.match(canvasView, /candidate\.pageIndex !== pageIndex/);
+  assert.match(canvasView, /\.\.\.\(validFocusedPagePatch \? \{ focusedPagePatch: validFocusedPagePatch \} : \{\}\)/);
+  assert.match(pageRenderer, /context\.focusedPagePatch\?\.pageIndex === pageIdx/);
+  assert.match(pageRenderer, /this\.renderFocusedPagePatch\(pageIdx,\s*canvas,\s*renderScale,\s*context\)/);
+  assert.match(pageRenderer, /layers\.imageCount > 0 \|\| layers\.rawSvgCount > 0/);
+  assert.match(pageRenderer, /this\.wasm\.renderPagePatchToCanvasFiltered\(/);
+  assert.match(wasmBridge, /renderPagePatchToCanvasFilteredWithProfile/);
 });
 
 test('CanvasView coalesces text-edit invalidations before rerendering a page', () => {
@@ -418,9 +458,84 @@ test('PageRenderer splits flow static images before the first Canvas2D flow rend
   assert.doesNotMatch(source, /'flow-static',\s*layers,\s*allowReuse,\s*false/);
   assert.match(source, /createOrReuseFlowImageLayer\(/);
   assert.match(source, /usesDomFlowImages \? overlays\.rawSvgCount/);
-  assert.match(source, /element\.src = `data:\$\{image\.mime\};base64,\$\{image\.base64\}`/);
+  // [#3315] DOM <img> 는 생산자가 정한 src 를 그대로 쓴다 — 전체 트리 경로의 data URL 이든
+  // 좁은 질의 경로의 신원 키별 object URL 이든 조립부는 분기하지 않는다.
+  assert.match(source, /element\.src = image\.src/);
   assert.match(source, /HWP_UNITS_PER_CSS_PIXEL = 75/);
   assert.match(source, /applyFlowImageCrop\(element, image, displayScale\)/);
+});
+
+// [#3315] 편집마다 전체 레이어 트리(그림 1장에 6.6MB)를 받던 자리를 좁은 질의가 대체한다.
+// 못 쓰는 경우에는 반드시 종전 경로로 되돌아가야 한다 — 조용히 그림을 빠뜨리면 안 된다.
+test('PageRenderer prefers the narrow flow-image query and keeps the full-tree fallback', () => {
+  const source = readFileSync(new URL('../src/view/page-renderer.ts', import.meta.url), 'utf8');
+  assert.match(source, /this\.wasm\.getPageFlowImageOps\(pageIdx\)/);
+  assert.match(source, /flowImageOpsFromNarrowQuery\(/);
+  assert.match(source, /this\.wasm\.getSourceImageBytes\(k\)/);
+  // fallback 경로가 남아 있어야 한다.
+  assert.match(source, /this\.wasm\.getPageLayerTree\(pageIdx\)/);
+  assert.match(source, /collectFlowImagePaintOps\(/);
+  assert.match(source, /private flowImageUrls = new FlowImageUrlCache\(\)/);
+});
+
+// [#3315 P1] 그림 키는 문서 안에서만 신원이므로(문서마다 `bin_data_id`·epoch 가 다시 시작)
+// 문서가 갈리는 경계에서 캐시를 넘겨야 한다. 그 경계는 캐시가 어느 문서의 것인지 정하는 자리다.
+test('PageRenderer hands the flow-image URL cache the document identity at the load boundary', () => {
+  const source = readFileSync(new URL('../src/view/page-renderer.ts', import.meta.url), 'utf8');
+  const beginStart = source.indexOf('  beginDocument(): void {');
+  assert.ok(beginStart >= 0, 'beginDocument 이 있어야 한다');
+  const beginBody = source.slice(
+    beginStart,
+    beginStart + source.slice(beginStart).indexOf('\n  }'),
+  );
+  assert.match(beginBody, /this\.flowImageUrls\.beginDocument\(/);
+  assert.match(beginBody, /digest: this\.wasm\.documentDigest/);
+  assert.match(beginBody, /generation: this\.wasm\.documentGeneration/);
+});
+
+// [#3315] 회수를 조회 시점에 두면 새 문서가 flow 그림을 한 장도 조회하지 않을 때 옛 문서의
+// object URL 이 renderer 수명 내내 남는다. 문서 (재)로드 경계가 캐시에 알려 줘야 한다.
+test('CanvasView notifies the renderer of the document boundary', () => {
+  const source = readFileSync(new URL('../src/view/canvas-view.ts', import.meta.url), 'utf8');
+  const prepareStart = source.indexOf('  prepareDocumentLoad(): void {');
+  assert.ok(prepareStart >= 0, 'prepareDocumentLoad 이 있어야 한다');
+  const prepareBody = source.slice(
+    prepareStart,
+    prepareStart + source.slice(prepareStart).indexOf('\n  }'),
+  );
+  assert.match(
+    prepareBody,
+    /this\.pageRenderer\.beginDocument\(\)/,
+    '문서 교체 경계가 renderer 의 문서 범위 자원을 넘기지 않으면 옛 문서 URL 이 남는다',
+  );
+});
+
+// [#3315 P1] object URL 캐시를 편집 경로에서 비우면 캐시가 없는 것과 같아진다.
+// `invalidateDocumentRevision` 은 renderer decision key 에 묶여 같은 문서 편집마다 불리므로
+// (canvas-view.ts 의 `decisionChanged && !changed`), 그 자리에서 회수해서는 안 된다.
+test('PageRenderer keeps the flow-image URL cache across edits and releases only on dispose', () => {
+  const source = readFileSync(new URL('../src/view/page-renderer.ts', import.meta.url), 'utf8');
+  const releaseSites = source.match(/this\.flowImageUrls\.releaseAll\(\)/g) ?? [];
+  assert.equal(releaseSites.length, 1, 'releaseAll 은 dispose 한 곳에서만 — 문서 경계는 beginDocument');
+
+  const disposeBody = source.slice(source.indexOf('  dispose(): void {'));
+  assert.match(
+    disposeBody.slice(0, disposeBody.indexOf('\n  }')),
+    /this\.flowImageUrls\.releaseAll\(\)/,
+    'dispose 는 URL 을 거둔다',
+  );
+
+  const invalidateStart = source.indexOf('  invalidateDocumentRevision(): void {');
+  assert.ok(invalidateStart >= 0, 'invalidateDocumentRevision 이 있어야 한다');
+  const invalidateBody = source.slice(
+    invalidateStart,
+    invalidateStart + source.slice(invalidateStart).indexOf('\n  }'),
+  );
+  assert.doesNotMatch(
+    invalidateBody,
+    /flowImageUrls/,
+    'invalidateDocumentRevision 은 편집마다 불리므로 URL 캐시를 건드리면 안 된다',
+  );
 });
 
 test('PageRenderer deferred image rerender preserves static layer reuse policy', () => {
@@ -429,7 +544,28 @@ test('PageRenderer deferred image rerender preserves static layer reuse policy',
   assert.match(source, /retrySignature: overlays\.signature/);
   assert.match(source, /reuseStaticFlow/);
   assert.match(source, /reuseStaticOverlay/);
-  assert.match(source, /const retryKey = `\$\{imageCount\}:\$\{rawSvgCount\}:\$\{policy\.retrySignature\}`/);
+  // [#3315] 재시도 키는 개수·overlay 서명만으로는 그림 **내용** 변화를 못 본다. 문서 신원과
+  // 그림 신원 키를 함께 들어야 blanket 리셋 없이 재사용 판정이 성립한다.
+  assert.match(source, /const retryKey = this\.buildImageRetryKey\(/);
+  const keyBuilder = source.slice(source.indexOf('private buildImageRetryKey('));
+  const keyBody = keyBuilder.slice(0, keyBuilder.indexOf('\n  }'));
+  assert.match(keyBody, /getPageSourceImageKeys\(pageIdx\)/, '그림 신원 키를 재료로 쓴다');
+  assert.match(keyBody, /documentDigest/, '문서 digest 를 재료로 쓴다');
+  assert.match(keyBody, /documentGeneration/, '문서 generation 을 재료로 쓴다');
+  assert.match(keyBody, /policy\.retrySignature/, 'overlay 서명도 유지한다');
+  assert.match(
+    keyBody,
+    /if \(rawSvgCount > 0\) return null;/,
+    'RawSvg는 source-image key와 decoder cache 상태로 판정할 수 없으므로 재사용하지 않는다',
+  );
+  // 판정 재료가 없으면 재사용하지 않는다 — 안전망을 없애는 쪽으로 작동해서는 안 된다.
+  assert.match(
+    keyBody,
+    /if \(imageKeys === null \|\| documentDigest === null\) return null;/,
+    '판정 재료가 없으면 null 로 재사용을 포기해야 한다',
+  );
+  assert.match(source, /retryKey !== null && this\.imageRetryCounts\.get\(pageIdx\) === retryKey/,
+    'null 키로는 재사용 조기 반환이 일어나면 안 된다');
   assert.match(source, /IMAGE_RE_RENDER_FALLBACK_DELAY_MS = 1500/);
   assert.match(source, /RAW_SVG_EARLY_RE_RENDER_DELAYS_MS = \[0, 32, 96, 240\]/);
   assert.match(source, /const job: ReRenderJob/);
@@ -542,6 +678,68 @@ test('CanvasKit image replay cache key includes payload fingerprint with repeate
   const second = canvasKitImageCacheKey({ imageRef: 7, mime: 'image/png', base64: 'BBBB' });
   assert.notEqual(first, second);
   assert.ok((first ?? '').startsWith('ref:7|image/png:4:'));
+  assert.match(first ?? '', /:blake3:[0-9a-f]{64}$/);
+
+  const fnvCollisionPngA =
+    'iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAFElEQVR4AQEJAPb/ALjHZwCHKJKlEgEDzUwrqc8AAAAASUVORK5CYII=';
+  const fnvCollisionPngB =
+    'iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAFElEQVR4AQEJAPb/AB3Rhl4tN/FbDzgDg0NfIYUAAAAASUVORK5CYII=';
+  assert.equal(fnvCollisionPngA.length, fnvCollisionPngB.length);
+  const fnvCollisionA = canvasKitImageCacheKey({
+    mime: 'image/png',
+    base64: fnvCollisionPngA,
+  }, 1);
+  const fnvCollisionB = canvasKitImageCacheKey({
+    mime: 'image/png',
+    base64: fnvCollisionPngB,
+  }, 1);
+  assert.notEqual(
+    fnvCollisionA,
+    fnvCollisionB,
+    'equal-length payloads that collide under FNV-1a must not share a cache identity',
+  );
+
+  const stable = canvasKitImageCacheKey(
+    { imageRef: 7, sourceImageKey: 'bin:3:7:src', mime: 'image/png', base64: 'AAAA' },
+    11,
+  );
+  const sameSource = canvasKitImageCacheKey(
+    { imageRef: 7, sourceImageKey: 'bin:3:7:src', mime: 'image/png', base64: 'BBBB' },
+    11,
+  );
+  const nextDocument = canvasKitImageCacheKey(
+    { imageRef: 7, sourceImageKey: 'bin:3:7:src', mime: 'image/png', base64: 'AAAA' },
+    12,
+  );
+  assert.equal(stable, sameSource, 'producer source key avoids rehashing unchanged image identity');
+  assert.equal(stable, 'document:11|source:bin:3:7:src');
+  assert.notEqual(stable, nextDocument, 'document generation isolates source and failure caches');
+
+  assert.equal(boundedCanvasKitSourceImageKey(' bin:3:7:src '), ' bin:3:7:src ');
+  assert.equal(boundedCanvasKitSourceImageKey('bin:\n3'), null);
+  assert.equal(boundedCanvasKitSourceImageKey('x'.repeat(257)), null);
+  assert.notEqual(
+    canvasKitImageCacheKey(
+      { sourceImageKey: ' bin:3:7:src ', mime: 'image/png', base64: 'AAAA' },
+      11,
+    ),
+    stable,
+    'opaque source identities must not be trimmed into cache collisions',
+  );
+  assert.ok(
+    canvasKitImageCacheKey(
+      { imageRef: 'x'.repeat(257), mime: 'image/png', base64: 'AAAA' },
+      11,
+    )?.includes('image/png:4:'),
+    'unbounded resource labels should fall back to the bounded payload fingerprint',
+  );
+  assert.ok(
+    canvasKitImageCacheKey(
+      { imageRef: 7, mime: 'x'.repeat(129), base64: 'AAAA' },
+      11,
+    )?.includes('application/octet-stream:4:'),
+    'unbounded MIME labels should not be copied into cache keys',
+  );
 });
 
 test('CanvasKit image crop source follows the same HWPUNIT crop scale as SVG replay', () => {

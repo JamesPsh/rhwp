@@ -1,7 +1,9 @@
 import type { DocumentPosition, CursorRect, LineInfo, CellPathEntry, NavContextEntry, CellBbox } from '@/core/types';
 import type { WasmBridge } from '@/core/wasm-bridge';
 // [#2756] 셀 좌표 축 헬퍼는 command.ts 와 단일 정의를 공유한다(축 유도 복제 금지).
-import { cellAxisPath } from './command';
+import { cellAxisPath, type FocusedCellCursorGeometry } from './command';
+// 제외 셀 Set 의 키 형식은 조립하는 쪽과 조회하는 쪽이 반드시 같아야 한다 → 단일 정의.
+import { excludedCellKey } from './cell-block-format';
 
 type CellSelectionReason = 'manual' | 'protected';
 
@@ -24,6 +26,12 @@ type PictureSelectionRef = {
 export class CursorState {
   private position: DocumentPosition = { sectionIndex: 0, paragraphIndex: 0, charOffset: 0 };
   private rect: CursorRect | null = null;
+  /** [#3137] 직전 rect가 현재 공개 pagination의 exact/hit geometry에서 출발했는지 여부. */
+  private focusedGeometryValid = false;
+  /** fast path로 적용한 마지막 deferred mutation revision. exact 조회 뒤에는 null이다. */
+  private focusedGeometryRevision: number | null = null;
+  /** mutation 직후 다음 moveTo 한 번에만 소비하는 focused geometry transition. */
+  private preparedFocusedGeometry: FocusedCellCursorGeometry | null = null;
 
   /** 수직 이동 시 원래 X 좌표를 기억 (§6.4.4 preferred X) */
   private preferredX: number | null = null;
@@ -169,6 +177,64 @@ export class CursorState {
     }
   }
 
+  /**
+   * 선택 범위를 명시적으로 세운다 — anchor 는 `start`, 커서는 `end` (Task #3416).
+   *
+   * `setAnchor()` 는 "현재 위치에서 선택을 시작한다" 이고 이미 anchor 가 있으면 아무것도 하지
+   * 않는다. undo 뒤 복원처럼 **범위 전체를 지정해야 하는** 자리에는 쓸 수 없어 따로 둔다.
+   *
+   * **두 끝이 모두 현재 문서에서 확인될 때만 세운다.** anchor/focus 의 소유자가 여기이므로
+   * "선택은 실재하는 위치를 가리킨다"(#2339)를 지키는 것도 여기 몫이다 — 호출부의 선의에
+   * 맡기면 호출부가 하나 늘 때마다 유령 범위가 되살아난다. 세우지 못하면 아무것도 바꾸지
+   * 않고 `false` 를 돌려준다(종전 선택 상태 그대로).
+   */
+  selectRange(
+    start: DocumentPosition,
+    end: DocumentPosition,
+    blockPhase: number | null = null,
+  ): boolean {
+    if (!this.isVerifiedBodyPosition(start) || !this.isVerifiedBodyPosition(end)) return false;
+    this.anchor = { ...start };
+    this.position = { ...end };
+    // 범위와 블록 상태를 **한 번에** 세운다. 따로 세우면 그 사이에 "단계는 있는데 범위가 없는"
+    // 상태가 생기고, 다음 F3 가 그 단계에서 이어 확장해 엉뚱한 범위를 만든다.
+    this._blockSelectionMode = blockPhase !== null;
+    this._expandPhase = blockPhase ?? 0;
+    this.updateRect();
+    return true;
+  }
+
+  /**
+   * 지금이 F3 블록 선택이면 그 확장 단계, 아니면 `null` (Task #3416).
+   *
+   * `null` 과 `0` 은 다르다 — `0` 은 "블록 모드인데 아직 확장 전"(F5 로 들어온 직후)이고
+   * `null` 은 "블록 모드가 아님"이다. 되살릴 때 이 둘을 같게 취급하면 평범한 드래그 선택이
+   * 블록 모드로 되살아난다.
+   */
+  blockSelectionPhase(): number | null {
+    return this._blockSelectionMode ? this._expandPhase : null;
+  }
+
+  /**
+   * 본문 좌표계에서 **실재가 확인된** 위치인가 (Task #3416).
+   *
+   * 셀 안 위치(`parentParaIndex`)는 `false` 다 — 확인이 중첩 셀 경로(`cellPath`)를 따라가는
+   * 별도 축이라 이 산술로는 실재를 말할 수 없다. "없다" 가 아니라 "이 판정으로는 확인할 수
+   * 없다" 는 뜻이고, 확인할 수 없는 위치를 세우지 않는 것이 #2339 의 판단과 같다.
+   */
+  private isVerifiedBodyPosition(pos: DocumentPosition): boolean {
+    if (pos.parentParaIndex !== undefined) return false;
+    try {
+      const paraCount = this.wasm.getParagraphCount(pos.sectionIndex);
+      if (pos.paragraphIndex < 0 || pos.paragraphIndex >= paraCount) return false;
+      const len = this.wasm.getParagraphLength(pos.sectionIndex, pos.paragraphIndex);
+      return pos.charOffset >= 0 && pos.charOffset <= len;
+    } catch {
+      // 조회 자체가 실패하면 그 위치를 실재한다고 말할 수 없다.
+      return false;
+    }
+  }
+
   /** 선택을 해제한다 */
   clearSelection(): void {
     this.anchor = null;
@@ -249,6 +315,87 @@ export class CursorState {
     return this.rect ? { ...this.rect } : null;
   }
 
+  private static sameFocusedCellPosition(
+    left: DocumentPosition,
+    right: DocumentPosition,
+  ): boolean {
+    if (
+      left.sectionIndex !== right.sectionIndex
+      || left.paragraphIndex !== right.paragraphIndex
+      || left.parentParaIndex !== right.parentParaIndex
+      || left.charOffset !== right.charOffset
+      || left.isTextBox !== right.isTextBox
+    ) {
+      return false;
+    }
+    const leftPath = cellAxisPath(left);
+    const rightPath = cellAxisPath(right);
+    return leftPath.length === rightPath.length
+      && leftPath.every((entry, index) => {
+        const other = rightPath[index];
+        return entry.controlIndex === other.controlIndex
+          && entry.cellIndex === other.cellIndex
+          && entry.cellParaIndex === other.cellParaIndex;
+      });
+  }
+
+  /**
+   * [#3137] mutation 결과의 같은-line transition을 다음 moveTo에 준비한다.
+   *
+   * 준비가 실패하면 mutation 뒤의 직전 rect는 더 이상 현재 문서의 exact geometry가
+   * 아니므로 invalid로 두고, moveTo가 기존 WASM exact query로 복구하게 한다.
+   */
+  prepareFocusedCellCursorGeometry(geometry: FocusedCellCursorGeometry): boolean {
+    this.preparedFocusedGeometry = null;
+    const revisionMatches = this.focusedGeometryRevision === null
+      || geometry.baseRevision === this.focusedGeometryRevision;
+    if (
+      !this.focusedGeometryValid
+      || !this.rect
+      || this.rect.cellOverflowed === true
+      || !Number.isFinite(geometry.deltaX)
+      || geometry.revision <= geometry.baseRevision
+      || !revisionMatches
+      || !CursorState.sameFocusedCellPosition(this.position, geometry.source)
+      || this.isInVerticalCell()
+    ) {
+      this.invalidateFocusedCellCursorGeometry();
+      return false;
+    }
+    this.preparedFocusedGeometry = geometry;
+    return true;
+  }
+
+  /** pagination commit/flush 또는 geometry 없는 mutation 뒤 다음 이동을 exact query로 강제한다. */
+  invalidateFocusedCellCursorGeometry(): void {
+    this.preparedFocusedGeometry = null;
+    this.focusedGeometryValid = false;
+    this.focusedGeometryRevision = null;
+  }
+
+  private applyPreparedFocusedCellCursorGeometry(): boolean {
+    const geometry = this.preparedFocusedGeometry;
+    this.preparedFocusedGeometry = null;
+    if (
+      !geometry
+      || !this.focusedGeometryValid
+      || !this.rect
+      || !CursorState.sameFocusedCellPosition(this.position, geometry.target)
+    ) {
+      return false;
+    }
+    const x = this.rect.x + geometry.deltaX;
+    if (!Number.isFinite(x)) return false;
+    const bounds = this.rect.cellBounds;
+    if (bounds && (x < bounds.x || x > bounds.x + Math.max(0, bounds.w))) {
+      return false;
+    }
+    this.rect = { ...this.rect, x };
+    this.focusedGeometryRevision = geometry.revision;
+    this.focusedGeometryValid = true;
+    return true;
+  }
+
   /** 커서가 셀 내부에 있는지 반환한다 */
   isInCell(): boolean {
     return (this.position.cellPath?.length ?? 0) > 0
@@ -295,8 +442,11 @@ export class CursorState {
   moveToHit(pos: DocumentPosition): void {
     this.position = { ...pos };
     this.atLineEnd = false;
+    this.preparedFocusedGeometry = null;
     if (pos.cursorRect) {
       this.rect = { ...pos.cursorRect };
+      this.focusedGeometryValid = true;
+      this.focusedGeometryRevision = null;
     } else {
       this.updateRect();
     }
@@ -1034,6 +1184,9 @@ export class CursorState {
     try {
       // 머리말/꼬리말 편집 모드
       if (this._headerFooterMode !== 'none') {
+        this.preparedFocusedGeometry = null;
+        this.focusedGeometryValid = false;
+        this.focusedGeometryRevision = null;
         const isHeader = this._headerFooterMode === 'header';
         this.rect = this.wasm.getCursorRectInHeaderFooter(
           this._hfSectionIdx, isHeader, this._hfApplyTo,
@@ -1044,6 +1197,9 @@ export class CursorState {
 
       // 각주 편집 모드
       if (this._footnoteMode) {
+        this.preparedFocusedGeometry = null;
+        this.focusedGeometryValid = false;
+        this.focusedGeometryRevision = null;
         const noteRect = this.wasm.getCursorRectInNote?.(
           this._fnSectionIdx,
           this._fnParaIdx,
@@ -1058,6 +1214,10 @@ export class CursorState {
         this.rect = this.wasm.getCursorRectInFootnote(
           this._fnPageNum, this._fnFootnoteIndex, this._fnInnerParaIdx, this._fnCharOffset,
         );
+        return;
+      }
+
+      if (this.applyPreparedFocusedCellCursorGeometry()) {
         return;
       }
 
@@ -1087,7 +1247,10 @@ export class CursorState {
           this.rect.pageIndex, this.position.cursorRect.pageIndex);
         this.rect = { ...this.position.cursorRect };
       }
+      this.focusedGeometryValid = this.rect !== null;
+      this.focusedGeometryRevision = null;
     } catch (e) {
+      this.invalidateFocusedCellCursorGeometry();
       // getCursorRect 실패 시 hitTest에서 전달된 cursorRect 폴백
       const pos = this.position;
       if (pos.cursorRect) {
@@ -1316,6 +1479,18 @@ export class CursorState {
     this.cellAnchor = { row: newRow, col: newCol };
     this.cellFocus = { row: newRow, col: newCol };
     this.excludedCells.clear();
+
+    // F5 단일 셀 선택의 화살표 이동은 하이라이트뿐 아니라 실제 편집 캐럿도 대상 셀 첫 위치로 옮긴다.
+    // 그래야 셀 선택을 끝낸 직후의 입력·서식 명령이 표시된 셀에 적용된다.
+    const targetCell = bboxes.find(b =>
+      newRow >= b.row && newRow < b.row + b.rowSpan
+        && newCol >= b.col && newCol < b.col + b.colSpan,
+    );
+    if (!targetCell) return;
+    this.preferredX = null;
+    this.atLineEnd = false;
+    this.moveToCellByIndex(sec, ppi, ci, cellPath, targetCell.cellIdx, 'start');
+    this.updateRect();
   }
 
   /** Shift+클릭: anchor 고정, focus를 클릭 셀로 이동 (범위 선택). */
@@ -1352,7 +1527,7 @@ export class CursorState {
   /** Ctrl+클릭: 해당 셀을 선택에서 제외/복원 토글. */
   ctrlToggleCell(row: number, col: number): void {
     if (!this._cellSelectionMode) return;
-    const key = `${row},${col}`;
+    const key = excludedCellKey(row, col);
     if (this.excludedCells.has(key)) {
       this.excludedCells.delete(key);
     } else {
@@ -1563,17 +1738,44 @@ export class CursorState {
     return this.selectedPictureRefs.length > 1;
   }
 
+  /**
+   * 선택된 개체 **밖**(인접 문단)의 위치. 커서를 옮기지도, 선택을 풀지도 않는다 (Task #3351).
+   *
+   * `moveOutOfSelectedPicture` 가 쓰던 규칙을 그대로 꺼낸 것이다. 개체 조작을 히스토리에
+   * 기록하는 쪽은 **위치만** 필요한데, 그러자고 선택을 푸는 메서드를 부를 수는 없기 때문이다.
+   * 규칙이 갈라지면 Delete 키 경로와 메뉴 경로의 착지가 또 어긋난다.
+   *
+   * 인접 문단을 잡을 수 없으면(개체가 든 문단이 유일) `null` 이다.
+   */
+  positionOutsideSelectedPicture(): DocumentPosition | null {
+    if (!this.selectedPictureRef) return null;
+    const { sec, ppi } = this.selectedPictureRef;
+    return this.positionOutsideObject(sec, ppi);
+  }
+
+  /**
+   * `sec` 구역 `ppi` 문단에 놓인 개체 **밖**의 위치 (Task #3351).
+   *
+   * 선택 상태를 읽지 않고 ref 만 받는다 — 클릭으로 z순서를 바꾸는 경로처럼 **선택 진입 전에**
+   * 기록해야 하는 자리가 있기 때문이다. 인접 문단을 잡을 수 없으면 `null`.
+   */
+  positionOutsideObject(sec: number, ppi: number): DocumentPosition | null {
+    const paraCount = this.wasm.getParagraphCount(sec);
+    if (ppi + 1 < paraCount) {
+      return { sectionIndex: sec, paragraphIndex: ppi + 1, charOffset: 0 };
+    }
+    if (ppi > 0) {
+      const prevLen = this.wasm.getParagraphLength(sec, ppi - 1);
+      return { sectionIndex: sec, paragraphIndex: ppi - 1, charOffset: prevLen };
+    }
+    return null;
+  }
+
   /** 개체 객체 선택 상태에서 개체 밖으로 커서를 이동한다. */
   moveOutOfSelectedPicture(): void {
     if (!this.selectedPictureRef) return;
-    const { sec, ppi } = this.selectedPictureRef;
-    const paraCount = this.wasm.getParagraphCount(sec);
-    if (ppi + 1 < paraCount) {
-      this.position = { sectionIndex: sec, paragraphIndex: ppi + 1, charOffset: 0 };
-    } else if (ppi > 0) {
-      const prevLen = this.wasm.getParagraphLength(sec, ppi - 1);
-      this.position = { sectionIndex: sec, paragraphIndex: ppi - 1, charOffset: prevLen };
-    }
+    const outside = this.positionOutsideSelectedPicture();
+    if (outside) this.position = outside;
     this.exitPictureObjectSelection();
     this.updateRect();
   }

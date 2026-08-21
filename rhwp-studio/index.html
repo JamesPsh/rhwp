@@ -36,6 +36,8 @@
           <div class="md-item disabled" data-cmd="file:print-to-pdf" title="브라우저 인쇄 창에서 ‘대상 → PDF로 저장’을 선택합니다."><span class="md-icon icon-pdf"></span><span class="md-label">PDF로 저장…</span></div>
           <div class="md-item disabled" data-cmd="file:save-as-hwp"><span class="md-icon"></span><span class="md-label">HWP 형식으로 저장...</span></div>
           <div class="md-item disabled" data-cmd="file:save-as-hwpx"><span class="md-icon"></span><span class="md-label">HWPX 형식으로 저장...</span></div>
+          <div class="md-item disabled" data-cmd="file:export-html"><span class="md-icon"></span><span class="md-label">HTML로 내보내기</span></div>
+          <div class="md-item disabled" data-cmd="file:export-doc" title="Word가 열 수 있는 HTML 기반 .doc 문서로 내보냅니다."><span class="md-icon"></span><span class="md-label">Word 문서(.doc)로 내보내기</span></div>
           <div class="md-sep"></div>
           <div class="md-item disabled" data-cmd="file:page-setup"><span class="md-icon icon-page-setup"></span><span class="md-label">편집 용지</span><span class="md-shortcut">F7</span></div>
           <div class="md-item disabled" data-cmd="file:print"><span class="md-icon icon-print"></span><span class="md-label">인쇄</span><span class="md-shortcut">Ctrl+P</span></div>
@@ -96,6 +98,10 @@
               <div class="md-item" role="menuitemradio" data-cmd="view:theme-system" data-theme-mode-choice="system"><span class="md-icon"></span><span class="md-label">시스템 설정</span></div>
               <div class="md-item" role="menuitemradio" data-cmd="view:theme-light" data-theme-mode-choice="light"><span class="md-icon"></span><span class="md-label">밝게</span></div>
               <div class="md-item" role="menuitemradio" data-cmd="view:theme-dark" data-theme-mode-choice="dark"><span class="md-icon"></span><span class="md-label">어둡게</span></div>
+              <div class="md-sep"></div>
+              <div class="md-item" role="menuitemradio" data-cmd="view:skin-oldschool" data-theme-skin-choice="oldschool"><span class="md-icon"></span><span class="md-label">올드스쿨</span></div>
+              <div class="md-item" role="menuitemradio" data-cmd="view:skin-default" data-theme-skin-choice="default"><span class="md-icon"></span><span class="md-label">클래식</span></div>
+              <div class="md-item" role="menuitemradio" data-cmd="view:skin-flat" data-theme-skin-choice="flat"><span class="md-icon"></span><span class="md-label">모던</span></div>
             </div>
           </div>
           <div class="md-sep"></div>
@@ -109,8 +115,8 @@
           <div class="md-sub">
             <span class="md-label">도구 상자</span><span class="md-arrow">▶</span>
             <div class="md-sub-panel">
-              <div class="md-item disabled" data-cmd="view:toolbox-basic"><span class="md-label">기본</span></div>
-              <div class="md-item disabled" data-cmd="view:toolbox-format"><span class="md-label">서식</span></div>
+              <div class="md-item" role="menuitemcheckbox" aria-checked="true" data-cmd="view:toolbox-basic"><span class="md-label">기본</span></div>
+              <div class="md-item" role="menuitemcheckbox" aria-checked="true" data-cmd="view:toolbox-format"><span class="md-label">서식</span></div>
             </div>
           </div>
         </div>
@@ -648,7 +654,7 @@
 
     <!-- 하단 상태 바 -->
     <footer id="status-bar">
-      <span id="sb-page" class="stb-item">1 / 1 쪽</span>
+      <button id="sb-page" class="stb-item stb-page-button" type="button" title="찾아가기 (Option+G)">1 / 1 쪽</button>
       <span class="stb-divider"></span>
       <span id="sb-section" class="stb-item">구역: 1 / 1</span>
       <span class="stb-divider"></span>
